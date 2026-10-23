@@ -7,6 +7,7 @@ import pytest
 
 from toolrank import execution, runner
 from toolrank.compilation import CompilerProcessResult, build_compilation_bundle
+from toolrank.process_deadline import DeadlineProcessResult
 from toolrank.schemas import ExecutionResult, ExecutionSchedule
 
 
@@ -18,7 +19,7 @@ def _write_report(path: Path, filename: str) -> None:
     )
 
 
-def _bundle(tmp_path: Path, target: Path):
+def _bundle(tmp_path: Path, target: Path, tools: list[str] | None = None):
     compiler = tmp_path / "solc-0.8.24"
     compiler.write_bytes(b"fake-solc")
     compiler.chmod(0o755)
@@ -45,7 +46,7 @@ def _bundle(tmp_path: Path, target: Path):
 
     return build_compilation_bundle(
         target,
-        ["smartian", "vandal"],
+        tools if tools is not None else ["smartian", "vandal"],
         installed_compilers={"0.8.24": compiler},
         compiler_invoker=invoke,
     )
@@ -56,6 +57,66 @@ def _smartbugs(tmp_path: Path, monkeypatch) -> Path:
     path.mkdir()
     monkeypatch.setattr(execution, "DEFAULT_SMARTBUGS_DIR", path)
     return path
+
+
+@pytest.mark.parametrize("shared_compiler", [False, True])
+def test_native_fallback_forwards_project_compiler_constraints(
+    tmp_path: Path,
+    monkeypatch,
+    shared_compiler: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "Main.sol"
+    target.write_text(
+        'pragma solidity ^0.8.0; import "./Lib.sol"; contract Main {}',
+        encoding="utf-8",
+    )
+    (project / "Lib.sol").write_text(
+        "pragma solidity <0.8.25; library Lib {}", encoding="utf-8"
+    )
+    tools = ["smartian", "slither"] if shared_compiler else ["slither"]
+    bundle = _bundle(tmp_path, project, tools) if shared_compiler else None
+    smartbugs = _smartbugs(tmp_path, monkeypatch)
+    (smartbugs / "sb").mkdir()
+    for name in ("cli.py", "docker.py"):
+        (smartbugs / "sb" / name).write_text("# test sentinel\n", encoding="utf-8")
+    # Prepared values must override inherited values as well as fill missing ones.
+    monkeypatch.setenv("LAKES_SOLIDITY_CONSTRAINTS", '["0.4.25"]')
+    seen: list[dict[str, str]] = []
+
+    def fake_run(command, *, env, **_kwargs):
+        seen.append(env)
+        _write_report(Path(command[command.index("--results") + 1]), target.name)
+        return DeadlineProcessResult(returncode=0, elapsed_seconds=0.1)
+
+    def fake_adapter(_tool_id, contract_path, out_dir, **_kwargs):
+        _write_report(Path(out_dir), Path(contract_path).name)
+        return 0
+
+    monkeypatch.setattr(execution, "run_process_with_deadline", fake_run)
+    monkeypatch.setattr(runner, "_run_adapter_with_deadline", fake_adapter)
+    plan = ExecutionResult(
+        status="planned",
+        target_path=str(project),
+        results_root=str(tmp_path / "results"),
+        selected_tool_ids=tools,
+        primary_tool_id=tools[0],
+        execution_schedule=ExecutionSchedule(tool_timeout_seconds=10),
+        compilation_bundle=bundle,
+    )
+
+    completed = execution._native_smartbugs_execute(plan)
+
+    assert completed.status == "executed", completed.stderr_tail
+    assert len(seen) == 1
+    assert seen[0]["LAKES_PROJECT_ROOT"] == str(project.resolve())
+    assert str(smartbugs) in seen[0]["PYTHONPATH"]
+    assert set(json.loads(seen[0]["LAKES_SOLIDITY_CONSTRAINTS"])) == (
+        {"0.8.24"} if shared_compiler else {"^0.8.0", "<0.8.25"}
+    )
+    if shared_compiler:
+        assert seen[0]["LAKES_EXECUTION_SOLC_VERSION"] == "0.8.24"
 
 
 def test_native_fallback_reuses_ready_bundle_without_recompile(

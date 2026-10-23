@@ -40,8 +40,7 @@ def select_project_solc_version(
     )
 
 
-def main() -> None:
-    import sb.cli
+def _install_project_patches() -> None:
     import sb.docker
     import sb.semantic_version
 
@@ -101,8 +100,18 @@ def main() -> None:
     sb.docker.__docker_volume = project_volume
     sb.docker.__docker_args = project_args
     sb.semantic_version.match = project_version_match
+
+
+def main() -> None:
+    import sb.cli
+
+    _install_project_patches()
     sb.cli.main()
 
 
 if __name__ == "__main__":
     main()
+elif __name__ == "__mp_main__":
+    # SmartBugs uses spawn workers, which reload this entrypoint before
+    # importing the analyser target and do not inherit parent monkeypatches.
+    _install_project_patches()

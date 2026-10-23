@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
+import pytest
+
+from toolrank import runner
 from toolrank.smartbugs_project import select_project_solc_version
 from toolrank.source_project import copy_dependency_tree, source_entrypoints
 
@@ -120,3 +127,84 @@ def test_project_bridge_compiler_selection_uses_full_constraint_intersection() -
         ["0.8.20"],
         {"0.8.19", "0.8.30"},
     ) is None
+
+
+@pytest.mark.parametrize("mode", ["solidity", "bytecode", "runtime"])
+def test_bridge_initializes_patches_in_real_spawn_worker(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    project = tmp_path / "project"
+    contracts = project / "contracts"
+    libraries = project / "lib"
+    contracts.mkdir(parents=True)
+    libraries.mkdir()
+    dependency = libraries / "Lib.sol"
+    dependency.write_text("pragma solidity <0.8.20; library Lib {}", encoding="utf-8")
+    (project / "Unrelated.sol").write_text("contract Unrelated {}", encoding="utf-8")
+    suffix = ".sol" if mode == "solidity" else ".hex"
+    entrypoint = contracts / f"Main{suffix}"
+    entrypoint.write_text(
+        'pragma solidity ^0.8.0; import "../lib/Lib.sol"; contract Main {}'
+        if mode == "solidity"
+        else "6000",
+        encoding="utf-8",
+    )
+    smartbugs = Path(__file__).resolve().parent / "fixtures" / "smartbugs_spawn"
+    with runner.prepare_smartbugs_invocation(
+        "slither" if mode == "solidity" else "mythril",
+        entrypoint,
+        tmp_path / "result",
+        target_root=project,
+        smartbugs_dir=smartbugs,
+        timeout=7,
+        input_kind="sol" if mode == "solidity" else mode,
+    ) as invocation:
+        command = invocation.command
+        env = invocation.env
+        if mode != "solidity":
+            # Exercise the bridge entrypoint for non-source tasks too, checking
+            # that worker initialization preserves their original staging.
+            command = [
+                sys.executable,
+                str(runner.SMARTBUGS_PROJECT_RUNNER),
+                *invocation.command[1:],
+            ]
+            env = {
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    (str(Path(runner.__file__).resolve().parents[1]), str(smartbugs))
+                ),
+                "LAKES_PROJECT_ROOT": str(project.resolve()),
+            }
+        completed = subprocess.run(
+            command,
+            cwd=invocation.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    probe = json.loads((tmp_path / "result" / "result.json").read_text())["probe"]
+    assert probe["start_method"] == "spawn"
+    assert probe["main_module"] == "__mp_main__"
+    assert probe["pid"] != probe["parent_pid"]
+    assert probe["parent_pid"] != os.getpid()
+    if mode == "solidity":
+        assert probe["files"] == {
+            "project/contracts/Main.sol": entrypoint.read_text(),
+            "project/lib/Lib.sol": dependency.read_text(),
+        }
+        filename = "/sb/project/contracts/Main.sol"
+        assert probe["compiler"] == "0.8.19"
+    else:
+        staged_name = "Main.rt.hex" if mode == "runtime" else "Main.hex"
+        assert probe["files"] == {staged_name: "6000"}
+        filename = f"/sb/{staged_name}"
+        assert probe["compiler"] is None
+    args = probe["docker_args"]
+    assert args["command"] == ["analyze", filename, "7", "/sb/bin", "0"]
+    assert args["entrypoint"] == ["entrypoint", filename]
+    assert list(args["volumes"].values()) == [{"bind": "/sb", "mode": "rw"}]

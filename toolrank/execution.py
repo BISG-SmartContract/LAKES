@@ -588,6 +588,7 @@ def _native_smartbugs_execute(
                             for name in (
                                 "PYTHONPATH",
                                 "LAKES_PROJECT_ROOT",
+                                "LAKES_SOLIDITY_CONSTRAINTS",
                                 "LAKES_EXECUTION_SOLC_VERSION",
                             ):
                                 if name in invocation.env:
