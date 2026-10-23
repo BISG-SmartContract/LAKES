@@ -612,6 +612,11 @@ def _native_smartbugs_execute(
                         report_path,
                         tool_id,
                         vulnerability_mapping,
+                        (
+                            str(contract_path.resolve())
+                            if input_kind in {"bytecode", "runtime"} or tool_id == "vandal"
+                            else None
+                        ),
                     ):
                         effective_returncode = 1
                     elif not promote_valid_report_tree(

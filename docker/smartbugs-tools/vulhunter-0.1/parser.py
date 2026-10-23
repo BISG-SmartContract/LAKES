@@ -87,6 +87,7 @@ def parse(
 
             # Process each vulnerability type entry
             for entry in data:
+                start_count = len(findings)
                 title = entry.get("title", "unknown")
                 severity = entry.get("severity", "unknown")
                 description = entry.get("description", "")
@@ -133,7 +134,7 @@ def parse(
 
                                     findings.append(finding)
                 # If no positions are found, still report on the finding
-                if len(findings) == 0:
+                if len(findings) == start_count:
                     findings.append({
                         "name": title,
                         "severity": severity,

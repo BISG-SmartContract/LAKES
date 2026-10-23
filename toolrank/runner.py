@@ -13,6 +13,7 @@ category ownership.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -61,7 +62,7 @@ from toolrank.report_validity import (
     promote_valid_report_tree,
     remove_or_quarantine_tree,
 )
-from toolrank.report_parser import load_per_tool_findings_from_run_dir
+from toolrank.report_parser import REPORT_INPUT_FILENAME_KEY, load_per_tool_findings_from_run_dir
 from toolrank.runner_adapter import (
     _enrich_report_with_categories,
     _load_mapping,
@@ -440,12 +441,19 @@ def _load_valid_gptscan_raw(report_path: Path) -> Optional[dict]:
     return payload
 
 
-def _write_enriched_report(report_path: Path, tool_id: str, mapping: dict[tuple[str, str], str]) -> bool:
+def _write_enriched_report(
+    report_path: Path,
+    tool_id: str,
+    mapping: dict[tuple[str, str], str],
+    input_filename: str | None = None,
+) -> bool:
     report = load_valid_report(report_path)
     if report is None:
         return False
     try:
         enriched = _enrich_report_with_categories(report, tool_id, mapping)
+        if input_filename is not None:
+            enriched[REPORT_INPUT_FILENAME_KEY] = input_filename
         report_path.write_text(
             json.dumps(enriched, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -660,7 +668,13 @@ def _run_gptscan(
         if raw_report is None:
             print("[warn] GPTScan output missing or structurally invalid", file=sys.stderr)
             return 1
-        report = _normalize_gptscan_report(raw_report)
+        report = _normalize_gptscan_report(
+            raw_report,
+            staged_source_root=scan_source,
+            original_source_root=(
+                resolved_root if resolved_root.is_dir() else contract_path.parent
+            ),
+        )
         result_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -671,7 +685,12 @@ def _run_gptscan(
             temp_dir.cleanup()
 
 
-def _normalize_gptscan_report(payload: dict) -> dict:
+def _normalize_gptscan_report(
+    payload: dict,
+    *,
+    staged_source_root: Path | None = None,
+    original_source_root: Path | None = None,
+) -> dict:
     report = {"errors": [], "fails": [], "findings": [], "infos": [], "parser": {"tool": "gptscan"}}
     if payload.get("success") is False:
         report["errors"].append("GPTSCAN_FAILED")
@@ -685,18 +704,31 @@ def _normalize_gptscan_report(payload: dict) -> dict:
         recommendation = item.get("recommendation") or ""
         if recommendation:
             message = f"{message}\nRecommendation: {recommendation}" if message else f"Recommendation: {recommendation}"
+        base_finding = {
+            **deepcopy(item),
+            "name": str(name),
+            "message": message,
+            "explanation": message,
+        }
         files = item.get("affectedFiles") or []
-        if not files:
-            report["findings"].append({"name": str(name), "message": message})
-            continue
+        start_count = len(report["findings"])
         for file_item in files:
             if not isinstance(file_item, dict):
                 continue
-            finding: dict[str, object] = {"name": str(name)}
-            if message:
-                finding["message"] = message
+            finding = deepcopy(base_finding)
             if file_item.get("filePath"):
-                finding["filename"] = str(file_item["filePath"])
+                filename = str(file_item["filePath"])
+                if staged_source_root is not None and original_source_root is not None:
+                    staged_path = Path(filename)
+                    if not staged_path.is_absolute():
+                        staged_path = staged_source_root / staged_path
+                    try:
+                        relative = staged_path.resolve().relative_to(staged_source_root.resolve())
+                    except ValueError:
+                        pass
+                    else:
+                        filename = str((original_source_root / relative).resolve())
+                finding["filename"] = filename
             range_item = file_item.get("range") or {}
             start = (range_item.get("start") or {}).get("line")
             end = (range_item.get("end") or {}).get("line")
@@ -704,6 +736,8 @@ def _normalize_gptscan_report(payload: dict) -> dict:
                 finding["line"] = int(start)
                 finding["line_end"] = int(end) if end is not None else int(start)
             report["findings"].append(finding)
+        if len(report["findings"]) == start_count:
+            report["findings"].append(base_finding)
     return report
 
 
@@ -1282,7 +1316,12 @@ def _run_adapter_with_deadline(
         if result_path is None:
             print(f"[warn] invalid current-run report tool={tool_id}", file=sys.stderr)
             return 1
-        if not _write_enriched_report(result_path, tool_id, mapping or {}):
+        input_filename = (
+            str(contract_path.resolve())
+            if request["input_kind"] in {"bytecode", "runtime"} or tool_id == "vandal"
+            else None
+        )
+        if not _write_enriched_report(result_path, tool_id, mapping or {}, input_filename):
             print(f"[warn] report enrichment failed tool={tool_id}", file=sys.stderr)
             return 1
         if not promote_valid_report_tree(

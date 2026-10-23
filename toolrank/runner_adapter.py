@@ -96,7 +96,6 @@ def _norm_label(label: str) -> str:
 
 def _normalize_vuln_name(name: str) -> str:
     normalized = name.strip().lower()
-    normalized = re.sub(r"\(.*?\)", "", normalized)
     normalized = re.sub(r"\bswc[-\s]*\d+\b", "", normalized)
     normalized = re.sub(r"\bmwe[-\s]*\d+\b\s*:?\s*", "", normalized)
     normalized = normalized.replace("-", " ").replace("_", " ")

@@ -5,7 +5,7 @@ import hashlib
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from toolrank.compilation import (
     CompilationManifest,
@@ -756,6 +756,7 @@ class Finding(BaseModel):
     """Normalized finding representation per paper Eq. 7: r = (t, ν, λ, γ, η).
 
     t = source_tool, ν = category, λ = location, γ = severity, η = explanation.
+    Severity retains the tool's string label or integer code.
     The ``raw`` dict preserves all original fields from the tool's output report.
     """
     model_config = ConfigDict(extra="forbid")
@@ -763,7 +764,7 @@ class Finding(BaseModel):
     source_tool: str
     category: str
     location: str = ""
-    severity: Optional[str] = None
+    severity: str | StrictInt | None = None
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     explanation: str = ""
     raw: Dict[str, Any] = Field(default_factory=dict, description="Original tool report fields, preserved verbatim.")
@@ -784,7 +785,7 @@ class FusedFinding(BaseModel):
     category: str
     location: str = ""
     source_tools: List[str] = Field(default_factory=list)
-    severity_values: Dict[str, List[str]] = Field(default_factory=dict)
+    severity_values: Dict[str, List[str | StrictInt]] = Field(default_factory=dict)
     confidence_values: Dict[str, List[float]] = Field(default_factory=dict)
     explanation_variants: Dict[str, List[str]] = Field(default_factory=dict)
     inconsistent_fields: List[Literal["severity", "confidence", "explanation"]] = Field(

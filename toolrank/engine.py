@@ -176,28 +176,15 @@ def _normalize_raw_findings(tool_id: str, raw_findings: list[dict[str, Any]]) ->
         category = normalize_category(category)
         if category.upper() == "IGNORE":
             continue
-        location = str(raw.get("location") or "").strip()
-        if not location:
-            file_value = raw.get("file") or raw.get("filename") or raw.get("sourceFile") or ""
-            line_value = raw.get("line") or raw.get("lineno") or raw.get("startLine") or ""
-            if file_value:
-                location = f"{file_value}:{line_value}" if line_value else str(file_value)
-        confidence = raw.get("confidence")
-        if confidence is not None:
-            try:
-                confidence = float(confidence)
-                if confidence > 1.0:
-                    confidence /= 100.0
-                if confidence < 0.0 or confidence > 1.0:
-                    confidence = None
-            except (TypeError, ValueError):
-                confidence = None
+        location = report_parser.normalize_finding_location(raw)
+        severity = report_parser.normalize_finding_severity(raw)
+        confidence = report_parser.normalize_finding_confidence(raw.get("confidence"))
         findings.append(
             Finding(
                 source_tool=tool_id,
                 category=category,
                 location=location,
-                severity=raw.get("severity") or raw.get("impact") or raw.get("level"),
+                severity=severity,
                 confidence=confidence,
                 explanation=str(
                     raw.get("explanation")

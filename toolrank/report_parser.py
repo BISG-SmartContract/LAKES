@@ -15,6 +15,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -27,6 +28,62 @@ logger = logging.getLogger(__name__)
 # analyzer JSON.  Structural guessing is unsafe because a legitimate finding
 # may itself contain keys such as ``raw``, ``category``, and ``location``.
 PARSER_PROJECTION_MARKER = "__lakes_parser_finding_projection_v1__"
+REPORT_INPUT_FILENAME_KEY = "__lakes_original_input_filename__"
+
+
+def normalize_finding_severity(item: Dict[str, Any]) -> Any:
+    """Keep a tool's severity label or code, including zero-valued codes."""
+    for key in ("severity", "impact", "level"):
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def normalize_finding_confidence(value: Any) -> float | None:
+    """Accept finite probabilities or percentages without repeated rescaling."""
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 100.0:
+        return None
+    return confidence / 100.0 if confidence > 1.0 else confidence
+
+
+def _position_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value, 16 if value.lower().startswith("0x") else 10)
+        except ValueError:
+            return None
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def normalize_finding_location(item: Dict[str, Any]) -> str:
+    """Prefer source lines, then contract-qualified bytecode instruction PCs."""
+    location = str(item.get("location") or "").strip()
+    if location:
+        return location
+    filename = next(
+        (str(item[key]).strip() for key in ("file", "filename", "sourceFile") if item.get(key)),
+        "",
+    )
+    if not filename:
+        return ""
+    for key in ("line", "lineno", "startLine"):
+        line = _position_integer(item.get(key))
+        if line is not None and line > 0:
+            return f"{filename}:{line}"
+    address = _position_integer(item.get("address"))
+    if address is not None:
+        contract = item.get("contract")
+        if isinstance(contract, str) and contract.strip():
+            return f"{filename}:contract:{contract.strip()}:pc:{address}"
+        return f"{filename}:pc:{address}"
+    return filename
 
 
 # ---------------------------------------------------------------------------
@@ -217,14 +274,7 @@ def _parse_sarif_file(
             severity = severity_map.get(level, "medium")
 
             rank = result.get("rank", result.get("properties", {}).get("confidence"))
-            confidence = None
-            if rank is not None:
-                try:
-                    confidence = float(rank)
-                    if confidence > 1.0:
-                        confidence = confidence / 100.0  # normalize 0-100 to 0-1
-                except (ValueError, TypeError):
-                    pass
+            confidence = normalize_finding_confidence(rank)
 
             # Explanation
             message = result.get("message", {}).get("text", "")
@@ -313,7 +363,17 @@ def _parse_json_file(
             continue
         if item.get("category") == "IGNORE":
             continue
-        findings.append(_normalize_json_finding(item, tool_id))
+        finding = _normalize_json_finding(item, tool_id)
+        input_filename = data.get(REPORT_INPUT_FILENAME_KEY) if isinstance(data, dict) else None
+        if isinstance(input_filename, str) and input_filename:
+            # Bytecode adapters run private temporary inputs. Use their logical
+            # input for fusion while retaining the analyzer's original filename.
+            finding["location"] = normalize_finding_location({
+                **item,
+                "location": "",
+                "file": input_filename,
+            })
+        findings.append(finding)
 
     return findings
 
@@ -355,25 +415,13 @@ def _normalize_json_finding(
     )
 
     # Location
-    location = item.get("location", "")
-    if not location:
-        file_val = item.get("file", item.get("filename", item.get("sourceFile", "")))
-        line_val = item.get("line", item.get("lineno", item.get("startLine", "")))
-        if file_val:
-            location = f"{file_val}:{line_val}" if line_val else str(file_val)
+    location = normalize_finding_location(item)
 
     # Severity
-    severity = item.get("severity", item.get("impact", item.get("level")))
+    severity = normalize_finding_severity(item)
 
     # Confidence
-    confidence = item.get("confidence")
-    if confidence is not None:
-        try:
-            confidence = float(confidence)
-            if confidence > 1.0:
-                confidence = confidence / 100.0
-        except (ValueError, TypeError):
-            confidence = None
+    confidence = normalize_finding_confidence(item.get("confidence"))
 
     # Explanation
     explanation = (

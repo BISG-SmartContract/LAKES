@@ -215,15 +215,15 @@ def _select_local_solc_bin(version: str, bins: Dict[str, Path]) -> Tuple[Optiona
 def _iter_path_entries(data: Any) -> List[Tuple[str, Dict[str, Any]]]:
     entries: List[Tuple[str, Dict[str, Any]]] = []
     if isinstance(data, dict):
+        # A single record may also contain nested trace or analysis metadata.
+        if any(k in data for k in ("bug_type", "from_function", "to_function", "state_variable", "file_name")):
+            return [("", data)]
         # Case A: {"tod_symex_path_1.json": {...}, ...}
         nested = [(k, v) for k, v in data.items() if isinstance(v, dict)]
         if nested:
             for k, v in nested:
                 entries.append((str(k), v))
             return entries
-        # Case B: single record dict
-        if any(k in data for k in ("bug_type", "from_function", "to_function", "state_variable", "file_name")):
-            entries.append(("", data))
     elif isinstance(data, list):
         for idx, item in enumerate(data):
             if isinstance(item, dict):
