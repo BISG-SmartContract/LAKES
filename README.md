@@ -15,6 +15,22 @@ The primary tool remains part of the selected plan. If no suitable complement is
 Download and extract the repository archive, then run these commands from the
 extracted directory containing `pyproject.toml`:
 
+Using [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync --locked
+uv run lakes --help
+```
+
+This creates `.venv`, installs the project in editable mode, and includes the
+development dependencies. `.python-version` selects Python 3.13, matching a CI
+target, and `uv.lock` pins the dependency versions. Use `uv sync --locked --no-dev`
+for runtime dependencies only. Run the test suite with `uv run pytest -q`.
+Prefix the commands below with `uv run`, or activate the environment with
+`source .venv/bin/activate`.
+
+Alternatively, install with pip in an activated virtual environment:
+
 ```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt

@@ -16,6 +16,14 @@ dependencies = [
   "semantic-version>=2.8.5",
 ]
 
+[dependency-groups]
+dev = [
+  "build",
+  "pytest",
+  "setuptools>=68",
+  "wheel",
+]
+
 [project.scripts]
 lakes = "toolrank.cli:main"
 lakes-runner = "toolrank.runner:main"
