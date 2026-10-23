@@ -93,6 +93,33 @@ def test_source_entrypoints_cover_isolated_import_cycle_and_normal_root(
     assert entrypoints == [cycle_a.resolve(), normal.resolve()]
 
 
+@pytest.mark.parametrize("cycle", [False, True])
+def test_selected_entrypoints_follow_returning_imports_without_promoting_dependencies(
+    tmp_path: Path, cycle: bool,
+) -> None:
+    contracts = tmp_path / "contracts"
+    libraries = tmp_path / "lib"
+    contracts.mkdir()
+    libraries.mkdir()
+    main = contracts / "ZMain.sol"
+    dependency = contracts / "ADep.sol"
+    bridge = libraries / "Bridge.sol"
+    main.write_text('import "../lib/Bridge.sol"; contract ZMain {}')
+    bridge.write_text(
+        'import "../contracts/ADep.sol"; '
+        + ('import "../contracts/ZMain.sol"; ' if cycle else '')
+        + 'library Bridge {}'
+    )
+    dependency.write_text('interface ADep {}')
+    assert source_entrypoints([main, dependency], tmp_path) == [dependency, main]
+    assert source_entrypoints([main, dependency], tmp_path, follow_imports=True) == [main]
+    # An SCC representative must belong to the selection, even when an
+    # outside dependency sorts before every selected source.
+    if cycle:
+        dependency.write_text('import "../lib/Bridge.sol"; interface ADep {}')
+        assert source_entrypoints([main, dependency], tmp_path, follow_imports=True) == [dependency]
+
+
 def test_quoted_fake_import_does_not_hide_an_independent_source_root(
     tmp_path: Path,
 ) -> None:

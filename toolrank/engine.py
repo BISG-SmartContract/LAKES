@@ -352,6 +352,7 @@ def _run_execution_pipeline(
     openai_api_base: str | None,
     combination_explanation: CombinationExplanation | None = None,
     selected_tool_solc_ranges: dict[str, str] | None = None,
+    project_root: str | Path | None = None,
 ) -> tuple[ExecutionResult, FusedReport, Path]:
     output_dir = canonical_contract_output_dir(results_root, target_path)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -370,6 +371,7 @@ def _run_execution_pipeline(
         gptscan_timeout_sec=gptscan_timeout_sec,
         write_lakes_output=False,
         selected_tool_solc_ranges=selected_tool_solc_ranges,
+        project_root=project_root,
     )
     runner_env: dict[str, str] = {}
     if openai_api_key:
@@ -430,6 +432,7 @@ def _run_execution_pipeline(
 def run_recommendation(
     *,
     target_path: str | None,
+    project_root: str | Path | None = None,
     toolcards_dir: str,
     tool_slots: int = 1,
     runtime_cap_minutes: float = 30.0,
@@ -460,6 +463,10 @@ def run_recommendation(
     _ = explain  # concise stage summaries are emitted through ``emit_stderr``.
     from toolrank.contract_profile import analyze_target
     from toolrank.scene_pool import build_scene_pool
+    from toolrank.source_project import resolve_project_root
+
+    if project_root is not None:
+        project_root = resolve_project_root(target_path, project_root)
 
     cards = load_toolcards(toolcards_dir)
     toolcards_path = Path(toolcards_dir)
@@ -479,7 +486,11 @@ def run_recommendation(
         static_snapshot = resolve_static_toolcard_snapshot(toolcards_path)
         db_path = static_snapshot.performance_db_path
         kb = load_performance_db(db_path) if db_path.exists() else _empty_kb()
-    features = analyze_target(target_path)
+    features = (
+        analyze_target(target_path, project_root=project_root)
+        if project_root is not None
+        else analyze_target(target_path)
+    )
     execution_schedule = ExecutionSchedule(
         contract_count=max(
             1,
@@ -696,6 +707,7 @@ def run_recommendation(
         }
         execution, fused, output_dir = _run_execution_pipeline(
             target_path=target_path,
+            project_root=project_root,
             composition=composition,
             results_root=run_results_root or "LAKES_out",
             runner_script=runner_script,

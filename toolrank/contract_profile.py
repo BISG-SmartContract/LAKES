@@ -13,6 +13,7 @@ from toolrank.solc_range import (
 from toolrank.source_project import (
     dependency_closure,
     mask_solidity_noncode_for_pragmas,
+    resolve_project_root,
     source_entrypoints,
 )
 from toolrank.target_inputs import classify_target_input
@@ -42,7 +43,16 @@ def _semver_key(version: str) -> tuple:
     return tuple(parts)
 
 
-def analyze_target(target_path: str | None) -> ContractFeatures:
+def analyze_target(
+    target_path: str | None,
+    *,
+    project_root: str | Path | None = None,
+) -> ContractFeatures:
+    explicit_root = (
+        resolve_project_root(target_path, project_root)
+        if project_root is not None
+        else None
+    )
     if not target_path:
         return ContractFeatures()
 
@@ -53,11 +63,13 @@ def analyze_target(target_path: str | None) -> ContractFeatures:
     sol_files: List[Path] = []
     bytecode_files: List[Path] = []
     runtime_files: List[Path] = []
-    source_root = path if path.is_dir() else path.parent
+    source_root = explicit_root or (path if path.is_dir() else path.parent)
+    source_inputs: list[Path] = []
 
     if path.is_file():
         input_kind = classify_target_input(path)
         if input_kind == "sol":
+            source_inputs = [path]
             sol_files = dependency_closure(path, source_root)
         elif input_kind == "bytecode":
             bytecode_files = [path]
@@ -70,6 +82,15 @@ def analyze_target(target_path: str | None) -> ContractFeatures:
             if candidate.is_file() and not candidate.is_symlink()
         ]
         sol_files = [candidate for candidate, kind in target_inputs if kind == "sol"]
+        if explicit_root is not None and sol_files:
+            source_inputs = source_entrypoints(
+                sol_files, source_root, follow_imports=True
+            )
+            sol_files = sorted({
+                dependency
+                for entrypoint in source_inputs
+                for dependency in dependency_closure(entrypoint, source_root)
+            })
         bytecode_files = [
             candidate for candidate, kind in target_inputs if kind == "bytecode"
         ]
@@ -153,7 +174,9 @@ def analyze_target(target_path: str | None) -> ContractFeatures:
 
     file_count = len(sol_files) + len(bytecode_files) + len(runtime_files)
     source_execution_count = (
-        len(source_entrypoints(sol_files, source_root)) if sol_files else 0
+        len(source_inputs)
+        if explicit_root is not None
+        else len(source_entrypoints(sol_files, source_root)) if sol_files else 0
     )
     features = ContractFeatures(
         target_path=str(path),

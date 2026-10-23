@@ -24,6 +24,11 @@ def root() -> None:
 @app.command("recommend")
 def recommend(
     target_path: Optional[str] = typer.Argument(None, help="Target contract file or directory."),
+    project_root: Optional[str] = typer.Option(
+        None,
+        "--project-root",
+        help="Project directory for resolving imports of the selected target.",
+    ),
     tool_slots: int = typer.Option(5, "--tool-slots", min=0, help="Budget: max concurrent tools."),
     runtime_cap_minutes: float = typer.Option(30.0, "--runtime-cap-minutes", help="Budget: runtime cap in minutes."),
     alert_cap: str = typer.Option("medium", "--alert-cap", help="Budget: alert cap (low|medium|high)."),
@@ -91,6 +96,7 @@ def recommend(
     try:
         result = run_recommendation(
             target_path=target_path,
+            project_root=project_root,
             toolcards_dir=toolcards_dir,
             tool_slots=tool_slots,
             runtime_cap_minutes=runtime_cap_minutes,

@@ -30,6 +30,7 @@ from toolrank.solc_range import (
 from toolrank.source_project import (
     dependency_closure,
     mask_solidity_noncode_for_pragmas,
+    resolve_project_root,
     source_entrypoints,
 )
 
@@ -220,23 +221,41 @@ def _relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
-def _discover_source_project(target_path: str | Path) -> _SourceProject | None:
-    target = Path(target_path).resolve()
+def _discover_source_project(
+    target_path: str | Path,
+    *,
+    project_root: str | Path | None = None,
+) -> _SourceProject | None:
+    try:
+        explicit_root = (
+            resolve_project_root(target_path, project_root)
+            if project_root is not None
+            else None
+        )
+    except ValueError as exc:
+        raise CompilationBundleError("INVALID_PROJECT_ROOT", str(exc)) from exc
+    target = (
+        Path(target_path).expanduser()
+        if explicit_root is not None
+        else Path(target_path)
+    ).resolve()
     if target.is_file():
         if target.is_symlink() or target.suffix.lower() != ".sol":
             return None
-        root = target.parent
+        root = explicit_root or target.parent
         entrypoints = [target]
     elif target.is_dir():
-        root = target
+        root = explicit_root or target
         source_files = [
             path
-            for path in sorted(root.rglob("*.sol"))
+            for path in sorted(target.rglob("*.sol"))
             if path.is_file() and not path.is_symlink()
         ]
         if not source_files:
             return None
-        entrypoints = source_entrypoints(source_files, root)
+        entrypoints = source_entrypoints(
+            source_files, root, follow_imports=explicit_root is not None
+        )
     else:
         return None
 
@@ -703,11 +722,13 @@ def validate_compilation_bundle(
     bundle: Stage3CompilationBundle,
     target_path: str | Path,
     selected_tools: Sequence[str],
+    *,
+    project_root: str | Path | None = None,
 ) -> Stage3CompilationBundle:
     """Validate bundle identity, current source bytes, and declared consumers."""
 
     _verify_internal(bundle)
-    project = _discover_source_project(target_path)
+    project = _discover_source_project(target_path, project_root=project_root)
     required = _required_components(selected_tools) if project is not None else []
     if not required:
         if bundle.manifest.status != CompilationStatus.NOT_APPLICABLE:
@@ -736,6 +757,7 @@ def build_compilation_bundle(
     target_path: str | Path,
     selected_tools: Sequence[str],
     *,
+    project_root: str | Path | None = None,
     selected_tool_solc_ranges: Mapping[str, str] | None = None,
     compiler_timeout_seconds: float = DEFAULT_COMPILATION_TIMEOUT_SECONDS,
     installed_compilers: Mapping[str, Path] | None = None,
@@ -746,7 +768,7 @@ def build_compilation_bundle(
 
     tools = list(dict.fromkeys(tool.strip().lower() for tool in selected_tools if tool.strip()))
     try:
-        project = _discover_source_project(target_path)
+        project = _discover_source_project(target_path, project_root=project_root)
     except CompilationBundleError as exc:
         return _failure_bundle(
             tools,
@@ -994,13 +1016,14 @@ def failed_compilation_bundle(
     target_path: str | Path,
     selected_tools: Sequence[str],
     *,
+    project_root: str | Path | None = None,
     code: str,
     detail: str,
 ) -> Stage3CompilationBundle:
     """Create typed failed preflight provenance for a rejected supplied bundle."""
 
     try:
-        project = _discover_source_project(target_path)
+        project = _discover_source_project(target_path, project_root=project_root)
     except CompilationBundleError:
         project = None
     tools = list(dict.fromkeys(tool.strip().lower() for tool in selected_tools if tool.strip()))

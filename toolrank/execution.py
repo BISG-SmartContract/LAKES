@@ -43,6 +43,7 @@ from toolrank.schemas import (
     ToolArtifactConsumption,
     ToolExecutionStatus,
 )
+from toolrank.source_project import resolve_project_root
 
 logger = logging.getLogger(__name__)
 COMPILATION_FAILURE_RETURN_CODE = 66
@@ -200,12 +201,23 @@ def build_execution_plan(
     results_root: str | Path,
     composition: CompositionPlan,
     *,
+    project_root: str | Path | None = None,
     runner_script: str | Path | None = None,
     runner_cwd: str | Path | None = None,
     gptscan_timeout_sec: int = 600,
     write_lakes_output: bool = True,
     selected_tool_solc_ranges: Mapping[str, str] | None = None,
 ) -> ExecutionResult:
+    resolved_project_root = (
+        resolve_project_root(target_path, project_root)
+        if project_root is not None
+        else None
+    )
+    target = (
+        Path(target_path).expanduser()
+        if resolved_project_root is not None
+        else Path(target_path)
+    ).resolve()
     runner_script_path = Path(runner_script) if runner_script else DEFAULT_RUNNER_SCRIPT
     if runner_script_path is None:
         raise ValueError("No runner script configured. Set LAKES_RUNNER_SCRIPT or pass --runner-script.")
@@ -219,7 +231,7 @@ def build_execution_plan(
     command = [
         sys.executable,
         str(runner_script_path),
-        str(Path(target_path).resolve()),
+        str(target),
         str(Path(results_root).resolve()),
         "--tools",
         ",".join(selected),
@@ -231,6 +243,8 @@ def build_execution_plan(
         str(gptscan_timeout_sec),
     ]
     command.extend(["--jobs", str(schedule.execution_jobs)])
+    if resolved_project_root is not None:
+        command.extend(["--project-root", str(resolved_project_root)])
     tool_categories = _tool_category_arg(category_mapping)
     if tool_categories:
         command.extend(["--tool_categories", tool_categories])
@@ -257,7 +271,8 @@ def build_execution_plan(
     return ExecutionResult(
         status="planned",
         execution_mode="manual_runner",
-        target_path=str(Path(target_path).resolve()),
+        target_path=str(target),
+        project_root=str(resolved_project_root) if resolved_project_root is not None else None,
         results_root=str(Path(results_root).resolve()),
         runner_script=str(runner_script_path.resolve()),
         runner_cwd=str(runner_cwd_path.resolve()) if runner_cwd_path else None,
@@ -273,6 +288,16 @@ def build_execution_plan(
     )
 
 
+def _resolve_execution_project(plan: ExecutionResult) -> ExecutionResult:
+    if plan.project_root is None:
+        return plan
+    project_root = resolve_project_root(plan.target_path, plan.project_root)
+    return plan.model_copy(update={
+        "target_path": str(Path(plan.target_path).expanduser().resolve()),
+        "project_root": str(project_root),
+    })
+
+
 def _prepare_compilation(plan: ExecutionResult) -> tuple[ExecutionResult, Stage3CompilationBundle]:
     target_path = Path(plan.target_path or "")
     selected_tools = list(dict.fromkeys(plan.selected_tool_ids))
@@ -282,14 +307,18 @@ def _prepare_compilation(plan: ExecutionResult) -> tuple[ExecutionResult, Stage3
             bundle = build_compilation_bundle(
                 target_path,
                 selected_tools,
+                project_root=plan.project_root,
                 selected_tool_solc_ranges=plan.selected_tool_solc_ranges,
             )
         elif bundle.manifest.status != CompilationStatus.FAILED:
-            validate_compilation_bundle(bundle, target_path, selected_tools)
+            validate_compilation_bundle(
+                bundle, target_path, selected_tools, project_root=plan.project_root
+            )
     except CompilationBundleError as exc:
         bundle = failed_compilation_bundle(
             target_path,
             selected_tools,
+            project_root=plan.project_root,
             code=exc.code,
             detail=exc.detail,
         )
@@ -369,7 +398,9 @@ def _native_smartbugs_execute(
         adapter_supports_input,
     )
 
+    plan = _resolve_execution_project(plan)
     target_path = Path(plan.target_path or "")
+    project_root = Path(plan.project_root) if plan.project_root is not None else None
     results_root = Path(plan.results_root or "")
     selected_tools = list(dict.fromkeys(tool for tool in plan.selected_tool_ids if tool))
     gptscan_api_base = ""
@@ -414,7 +445,9 @@ def _native_smartbugs_execute(
             update={"status": "failed", "stderr_tail": "No SmartBugs directory configured. Set LAKES_SMARTBUGS_DIR."}
         )
     try:
-        target_inputs = packaged_runner._discover_target_inputs(target_path)
+        target_inputs = packaged_runner._discover_target_inputs(
+            target_path, project_root=project_root
+        )
     except ValueError as exc:
         return plan.model_copy(
             update={"status": "failed", "stderr_tail": f"Invalid source project: {exc}"}
@@ -516,6 +549,7 @@ def _native_smartbugs_execute(
             logical_input_id = packaged_runner._logical_input_id(
                 contract_path,
                 target_path,
+                project_root=project_root,
             )
             out_dir = results_root / tool_id / relative
             out_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -543,6 +577,7 @@ def _native_smartbugs_execute(
                     contract_path,
                     out_dir,
                     target_root=target_path,
+                    project_root=project_root,
                     smartbugs_dir=smartbugs_dir,
                     timeout=resolved_timeout,
                     gptscan_timeout=int(resolved_timeout),
@@ -575,6 +610,7 @@ def _native_smartbugs_execute(
                         contract_path,
                         staged_out,
                         target_root=target_path,
+                        project_root=project_root,
                         smartbugs_dir=smartbugs_dir,
                         timeout=resolved_timeout,
                         input_kind=input_kind,
@@ -756,6 +792,7 @@ def execute_plan(
     *,
     runner_env: Mapping[str, str] | None = None,
 ) -> ExecutionResult:
+    plan = _resolve_execution_project(plan)
     if not plan.runner_command:
         return plan.model_copy(update={"status": "failed", "stderr_tail": "missing runner command"})
 

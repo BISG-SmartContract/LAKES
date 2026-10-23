@@ -7,6 +7,32 @@ from pathlib import Path
 import shutil
 
 
+def resolve_project_root(
+    target_path: str | Path | None,
+    project_root: str | Path | None = None,
+) -> Path:
+    """Resolve the import boundary without changing the selected analysis target."""
+
+    if not target_path:
+        raise ValueError("--project-root requires a target path")
+    target = Path(target_path).expanduser()
+    resolved_target = target.resolve()
+    if project_root is None:
+        return resolved_target if resolved_target.is_dir() else resolved_target.parent
+    root = Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"--project-root must be an existing directory: {root}")
+    if not resolved_target.is_file() and not resolved_target.is_dir():
+        raise ValueError(f"target path not found: {resolved_target}")
+    try:
+        resolved_target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("target must be inside --project-root") from exc
+    if target.is_symlink():
+        raise ValueError("target must not be a symlink")
+    return root
+
+
 def mask_solidity_noncode_for_pragmas(text: str) -> str:
     """Mask comments and quoted literals while preserving code and newlines.
 
@@ -180,8 +206,17 @@ def _resolve_import(source: Path, import_path: str, root: Path) -> Path | None:
     return None
 
 
-def source_entrypoints(source_files: list[Path], project_root: Path) -> list[Path]:
-    """Return import-graph roots instead of treating dependencies as targets."""
+def source_entrypoints(
+    source_files: list[Path],
+    project_root: Path,
+    *,
+    follow_imports: bool = False,
+) -> list[Path]:
+    """Return import-graph roots instead of treating dependencies as targets.
+
+    With ``follow_imports``, traverse dependencies outside the source selection
+    while keeping every returned entrypoint inside that selection.
+    """
 
     root = project_root.resolve()
     source_set = {
@@ -190,13 +225,41 @@ def source_entrypoints(source_files: list[Path], project_root: Path) -> list[Pat
         if _is_safe_regular_file(path, project_root)
     }
     graph: dict[Path, set[Path]] = {source: set() for source in source_set}
-    for source in source_set:
+    pending = deque(sorted(source_set))
+    while pending:
+        source = pending.popleft()
         for import_path in solidity_imports(source):
             resolved = _resolve_import(source, import_path, root)
-            if resolved in source_set:
+            if resolved is not None and (follow_imports or resolved in source_set):
                 graph[source].add(resolved)
+                if resolved not in graph:
+                    graph[resolved] = set()
+                    pending.append(resolved)
     if source_files and not graph:
         raise ValueError("source project contains no safe Solidity entrypoint")
+
+    if follow_imports:
+        reachable: dict[Path, set[Path]] = {}
+        for source in source_set:
+            pending_sources = [source]
+            visited: set[Path] = set()
+            while pending_sources:
+                current = pending_sources.pop()
+                if current not in visited:
+                    visited.add(current)
+                    pending_sources.extend(graph[current] - visited)
+            reachable[source] = visited & source_set
+        # Keep one selected representative per root SCC. A dependency that
+        # leaves the selection and returns must not become another target.
+        return [
+            source
+            for source in sorted(source_set)
+            if not any(
+                source in reachable[other]
+                and (other not in reachable[source] or other < source)
+                for other in source_set - {source}
+            )
+        ]
 
     imported = {dependency for dependencies in graph.values() for dependency in dependencies}
     entrypoints = sorted(source_set - imported)

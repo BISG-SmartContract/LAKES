@@ -722,6 +722,7 @@ class ExecutionResult(BaseModel):
     )
     execution_mode: str = "none"
     target_path: Optional[str] = None
+    project_root: Optional[str] = None
     results_root: Optional[str] = None
     runner_script: Optional[str] = None
     runner_cwd: Optional[str] = None

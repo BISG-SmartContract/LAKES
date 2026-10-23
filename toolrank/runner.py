@@ -74,6 +74,7 @@ from toolrank.source_project import (
     copy_dependency_tree,
     dependency_closure,
     mask_solidity_noncode_for_pragmas,
+    resolve_project_root,
     solidity_imports,
     source_entrypoints,
 )
@@ -375,7 +376,18 @@ class RunnerInput:
     kind: str
 
 
-def _discover_target_inputs(target_path: Path) -> list[RunnerInput]:
+def _discover_target_inputs(
+    target_path: Path,
+    *,
+    project_root: Path | None = None,
+) -> list[RunnerInput]:
+    source_root = (
+        resolve_project_root(target_path, project_root)
+        if project_root is not None
+        else target_path
+    )
+    if project_root is not None:
+        target_path = target_path.expanduser().resolve()
     if target_path.is_file():
         kind = classify_target_input(target_path)
         return [RunnerInput(target_path, kind)] if kind is not None else []
@@ -390,7 +402,9 @@ def _discover_target_inputs(target_path: Path) -> list[RunnerInput]:
         and (kind := classify_target_input(path)) is not None
     ]
     source_files = [path for path, kind in classified if kind == "sol"]
-    source_roots = source_entrypoints(source_files, target_path)
+    source_roots = source_entrypoints(
+        source_files, source_root, follow_imports=project_root is not None
+    )
     inputs = [RunnerInput(path, "sol") for path in source_roots]
     inputs.extend(
         RunnerInput(path, kind)
@@ -409,8 +423,17 @@ def _relative_contract_path(contract_path: Path, target_root: Path) -> Path:
         return Path(contract_path.name)
 
 
-def _logical_input_id(contract_path: Path, target_root: Path) -> str:
-    project_root = target_root if target_root.is_dir() else contract_path.parent
+def _logical_input_id(
+    contract_path: Path,
+    target_root: Path,
+    *,
+    project_root: Path | None = None,
+) -> str:
+    project_root = (
+        resolve_project_root(contract_path, project_root)
+        if project_root is not None
+        else target_root if target_root.is_dir() else contract_path.parent
+    )
     try:
         return contract_path.resolve().relative_to(project_root.resolve()).as_posix()
     except ValueError:
@@ -547,8 +570,13 @@ def _run_solc_select(
     tool_label: str,
     *,
     target_root: Path | None = None,
+    entrypoints: Sequence[Path] | None = None,
 ) -> bool:
-    constraints = _collect_pragma_specs(contract_path, target_root=target_root)
+    constraints = [
+        constraint
+        for entrypoint in (entrypoints if entrypoints is not None else [contract_path])
+        for constraint in _collect_pragma_specs(entrypoint, target_root=target_root)
+    ]
     if not constraints:
         print(f"[warn] pragma lower-bound not found; keep current solc for {tool_label}", file=sys.stderr)
         return True
@@ -589,15 +617,38 @@ def _run_gptscan(
     *,
     model: str = "",
     target_root: Path | None = None,
+    project_root: Path | None = None,
 ) -> int:
     if not GPTSCAN_MAIN.exists():
         print(f"[warn] GPTScan main.py not found: {GPTSCAN_MAIN}", file=sys.stderr)
         return 1
     resolved_root = target_root or contract_path
+    source_root = (
+        resolve_project_root(contract_path, project_root)
+        if project_root is not None
+        else resolved_root if resolved_root.is_dir() else contract_path.parent
+    )
+    entrypoints = None
+    if project_root is not None:
+        try:
+            entrypoints = [
+                target.path
+                for target in _discover_target_inputs(
+                    resolved_root, project_root=source_root
+                )
+                if target.kind == "sol"
+            ]
+        except ValueError as exc:
+            print(f"[warn] GPTScan source discovery failed: {exc}", file=sys.stderr)
+            return 1
+        if not entrypoints:
+            print("[warn] GPTScan source selection has no Solidity entrypoint", file=sys.stderr)
+            return 1
     if not _run_solc_select(
         contract_path,
         "gptscan",
-        target_root=resolved_root,
+        target_root=source_root,
+        **({"entrypoints": entrypoints} if entrypoints is not None else {}),
     ):
         return 1
     temp_dir: Optional[tempfile.TemporaryDirectory[str]] = tempfile.TemporaryDirectory(
@@ -605,21 +656,17 @@ def _run_gptscan(
     )
     scan_source = Path(temp_dir.name)
     try:
-        if resolved_root.is_dir():
+        if entrypoints is None and resolved_root.is_dir():
             source_files = [
                 path
                 for path in sorted(resolved_root.rglob("*.sol"))
                 if path.is_file() and not path.is_symlink()
             ]
-            entrypoints = source_entrypoints(source_files, resolved_root)
-            for entrypoint in entrypoints:
-                copy_dependency_tree(entrypoint, resolved_root, scan_source)
-        else:
-            copy_dependency_tree(
-                contract_path,
-                contract_path.parent,
-                scan_source,
-            )
+            entrypoints = source_entrypoints(source_files, source_root)
+        elif entrypoints is None:
+            entrypoints = [contract_path]
+        for entrypoint in entrypoints:
+            copy_dependency_tree(entrypoint, source_root, scan_source)
     except (OSError, ValueError) as exc:
         print(f"[warn] GPTScan source staging failed: {exc}", file=sys.stderr)
         temp_dir.cleanup()
@@ -649,6 +696,12 @@ def _run_gptscan(
     env["LAKES_GPTSCAN_MAIN"] = str(GPTSCAN_MAIN)
     env["LAKES_GPTSCAN_SOURCE"] = str(scan_source)
     env["LAKES_GPTSCAN_OUTPUT"] = str(gpt_out)
+    env.pop("LAKES_GPTSCAN_ENTRYPOINTS", None)
+    if project_root is not None:
+        env["LAKES_GPTSCAN_ENTRYPOINTS"] = json.dumps([
+            entrypoint.relative_to(source_root).as_posix()
+            for entrypoint in entrypoints
+        ])
     masked = command[:]
     if "-k" in masked:
         key_index = masked.index("-k") + 1
@@ -671,9 +724,7 @@ def _run_gptscan(
         report = _normalize_gptscan_report(
             raw_report,
             staged_source_root=scan_source,
-            original_source_root=(
-                resolved_root if resolved_root.is_dir() else contract_path.parent
-            ),
+            original_source_root=source_root,
         )
         result_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
@@ -975,9 +1026,20 @@ def prepare_smartbugs_invocation(
     input_kind: str,
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
+    project_root: Path | None = None,
 ) -> Iterator[SmartBugsInvocation]:
     """Prepare one typed generic SmartBugs invocation and clean temp input."""
 
+    try:
+        resolved_project_root = (
+            resolve_project_root(contract_path, project_root)
+            if project_root is not None
+            else None
+        )
+    except ValueError as exc:
+        raise SmartBugsPreparationError(str(exc)) from exc
+    if resolved_project_root is not None:
+        contract_path = contract_path.expanduser().resolve()
     temp_input_dir: Optional[tempfile.TemporaryDirectory[str]] = None
     target_input = contract_path
     runtime_mode = False
@@ -1027,7 +1089,8 @@ def prepare_smartbugs_invocation(
             else None
         )
         requires_project_bridge = effective_kind == "sol" and (
-            bool(exact_execution_solc)
+            resolved_project_root is not None
+            or bool(exact_execution_solc)
             or not (target_root.is_file() and not solidity_imports(contract_path))
         )
         if requires_project_bridge and not smartbugs_api_available:
@@ -1051,14 +1114,16 @@ def prepare_smartbugs_invocation(
                 )
                 if part
             )
-            project_root = target_root if target_root.is_dir() else contract_path.parent
-            env["LAKES_PROJECT_ROOT"] = str(project_root.resolve())
+            source_root = resolved_project_root or (
+                target_root if target_root.is_dir() else contract_path.parent
+            )
+            env["LAKES_PROJECT_ROOT"] = str(source_root.resolve())
             env["LAKES_SOLIDITY_CONSTRAINTS"] = json.dumps(
                 [exact_execution_solc]
                 if exact_execution_solc
                 else _collect_pragma_specs(
                     contract_path,
-                    target_root=target_root,
+                    target_root=source_root,
                 )
             )
             if exact_execution_solc:
@@ -1127,7 +1192,13 @@ def _run_smartbugs_tool(
     input_kind: str = "sol",
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
+    project_root: Path | None = None,
 ) -> int:
+    source_root = (
+        resolve_project_root(contract_path, project_root)
+        if project_root is not None
+        else target_root
+    )
     if not adapter_supports_input(tool_id, input_kind):
         print(
             f"[unsupported] tool={tool_id} input_kind={input_kind}",
@@ -1135,7 +1206,7 @@ def _run_smartbugs_tool(
         )
         return UNSUPPORTED_INPUT_RETURN_CODE
     if tool_id == "securify2":
-        return _run_securify2(contract_path, out_dir, target_root=target_root)
+        return _run_securify2(contract_path, out_dir, target_root=source_root)
     if tool_id == "gptscan":
         return _run_gptscan(
             contract_path,
@@ -1145,9 +1216,10 @@ def _run_smartbugs_tool(
             openai_api_base,
             model=gptscan_model,
             target_root=target_root,
+            project_root=project_root,
         )
     if tool_id == "sailfish":
-        return _run_sailfish(contract_path, out_dir, timeout, target_root=target_root)
+        return _run_sailfish(contract_path, out_dir, timeout, target_root=source_root)
     if tool_id == "smartian":
         if compilation_bundle is None or logical_input_id is None:
             print("[warn] Smartian source route requires shared compilation", file=sys.stderr)
@@ -1156,7 +1228,7 @@ def _run_smartbugs_tool(
             contract_path,
             out_dir,
             timeout,
-            target_root=target_root,
+            target_root=source_root,
             compilation_bundle=compilation_bundle,
             logical_input_id=logical_input_id,
         )
@@ -1172,6 +1244,7 @@ def _run_smartbugs_tool(
             input_kind=input_kind,
             compilation_bundle=compilation_bundle,
             logical_input_id=logical_input_id,
+            project_root=project_root,
         ) as invocation:
             return _stream_process(
                 invocation.command,
@@ -1201,6 +1274,11 @@ def _adapter_worker_main() -> int:
             Path(request["contract_path"]),
             Path(request["out_dir"]),
             target_root=Path(request["target_root"]),
+            project_root=(
+                Path(request["project_root"])
+                if request.get("project_root") is not None
+                else None
+            ),
             smartbugs_dir=(
                 Path(request["smartbugs_dir"])
                 if request.get("smartbugs_dir")
@@ -1256,6 +1334,7 @@ def _run_adapter_with_deadline(
     input_kind: str | None = None,
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
+    project_root: Path | None = None,
 ) -> int:
     """Enforce one outer deadline around the complete adapter implementation."""
     if not remove_or_quarantine_tree(out_dir, quarantine_root):
@@ -1270,6 +1349,7 @@ def _run_adapter_with_deadline(
             "contract_path": str(contract_path),
             "out_dir": str(staged_out),
             "target_root": str(target_root),
+            "project_root": str(project_root) if project_root is not None else None,
             "smartbugs_dir": str(smartbugs_dir) if smartbugs_dir is not None else None,
             "timeout": (
                 float(timeout)
@@ -1354,6 +1434,7 @@ def _run_one_tool_for_contract(
     input_kind: str | None = None,
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
+    project_root: Path | None = None,
 ) -> tuple[str, int, float]:
     rel = _relative_contract_path(contract_path, target_root)
     tool_id = _map_tool_name(tool_name)
@@ -1375,6 +1456,7 @@ def _run_one_tool_for_contract(
         input_kind=input_kind or classify_target_input(contract_path) or "sol",
         compilation_bundle=compilation_bundle,
         logical_input_id=logical_input_id,
+        project_root=project_root,
     )
     if rc != 0:
         print(f"[warn] tool run failed tool={tool_id} exit_code={rc}", file=sys.stderr)
@@ -1408,6 +1490,7 @@ def _run_one_contract(
     input_kind: str | None = None,
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
+    project_root: Path | None = None,
 ) -> tuple[int, dict[str, ToolExecutionStatus]]:
     exit_code = 0
     statuses: dict[str, ToolExecutionStatus] = {}
@@ -1428,6 +1511,7 @@ def _run_one_contract(
                 input_kind=input_kind,
                 compilation_bundle=compilation_bundle,
                 logical_input_id=logical_input_id,
+                project_root=project_root,
             )
             if rc != 0:
                 exit_code = (
@@ -1476,6 +1560,7 @@ def _run_one_contract(
                 input_kind=input_kind,
                 compilation_bundle=compilation_bundle,
                 logical_input_id=logical_input_id,
+                project_root=project_root,
             ): tool_name
             for tool_name in selected_tools
         }
@@ -1689,8 +1774,21 @@ def run_targets(
     write_lakes_output: bool = True,
     compilation_bundle: Stage3CompilationBundle | str | Path | None = None,
     selected_tool_solc_ranges: dict[str, str] | None = None,
+    project_root: str | Path | None = None,
 ) -> int:
-    target = Path(target_path).resolve()
+    try:
+        project_root = (
+            resolve_project_root(target_path, project_root)
+            if project_root is not None
+            else None
+        )
+    except ValueError as exc:
+        _die(f"Invalid source project: {exc}", 2)
+    target = (
+        Path(target_path).expanduser()
+        if project_root is not None
+        else Path(target_path)
+    ).resolve()
     root = Path(results_root).expanduser().absolute()
     if not target.exists():
         _die(f"Target path not found: {target}", 1)
@@ -1705,7 +1803,7 @@ def run_targets(
         _die("No tools selected. Use --tool or --tools.", 1)
 
     try:
-        target_inputs = _discover_target_inputs(target)
+        target_inputs = _discover_target_inputs(target, project_root=project_root)
     except ValueError as exc:
         _die(f"Invalid source project: {exc}", 1)
     if not target_inputs:
@@ -1760,6 +1858,7 @@ def run_targets(
         bundle = build_compilation_bundle(
             target,
             mapped_tools,
+            project_root=project_root,
             selected_tool_solc_ranges=selected_tool_solc_ranges,
         )
     else:
@@ -1770,11 +1869,14 @@ def run_targets(
                 else compilation_bundle
             )
             if bundle.manifest.status != CompilationStatus.FAILED:
-                validate_compilation_bundle(bundle, target, mapped_tools)
+                validate_compilation_bundle(
+                    bundle, target, mapped_tools, project_root=project_root
+                )
         except CompilationBundleError as exc:
             bundle = failed_compilation_bundle(
                 target,
                 mapped_tools,
+                project_root=project_root,
                 code=exc.code,
                 detail=exc.detail,
             )
@@ -1801,7 +1903,9 @@ def run_targets(
     gptscan_source_dispatched = False
     for index, target_input in enumerate(target_inputs, start=1):
         contract = target_input.path
-        logical_input_id = _logical_input_id(contract, target)
+        logical_input_id = _logical_input_id(
+            contract, target, project_root=project_root
+        )
         print(
             f"\n[batch] {index}/{len(target_inputs)} "
             f"kind={target_input.kind} {contract}"
@@ -1816,6 +1920,7 @@ def run_targets(
         rc, contract_statuses = _run_one_contract(
             contract,
             target_root=target,
+            project_root=project_root,
             results_root=tool_results_root,
             selected_tools=tools_for_input,
             mapping=mapping,
@@ -1878,6 +1983,10 @@ def run_targets(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run LAKES-selected SmartBugs-style analyzers.")
     parser.add_argument("contract_or_dir", help="Path to a .sol file or directory.")
+    parser.add_argument(
+        "--project-root", default=None,
+        help="Project directory for resolving imports of the selected target.",
+    )
     parser.add_argument("results_root", nargs="?", default="LAKES_out", help="Output root for analyzer reports.")
     parser.add_argument("--tool", default="", help="Single tool name to run.")
     parser.add_argument("--tools", default="", help="Comma-separated tool names to run.")
@@ -1942,6 +2051,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_lakes_output=not args.no_lakes_output,
         compilation_bundle=args.compilation_bundle or None,
         selected_tool_solc_ranges=tool_solc_ranges,
+        project_root=args.project_root,
     )
 
 

@@ -26,6 +26,10 @@ This creates `.venv`, installs the project in editable mode, and includes the
 development dependencies. `.python-version` selects Python 3.13, matching a CI
 target, and `uv.lock` pins the dependency versions. Use `uv sync --locked --no-dev`
 for runtime dependencies only. Run the test suite with `uv run pytest -q`.
+To include real GPTScan/Falcon and shared-solc compilation regressions using an
+existing LAKES Docker image, run
+`LAKES_TEST_RUNTIME_IMAGE=lakes:latest uv run pytest -q tests/test_project_root.py`.
+These compiler tests run without network access or LLM calls.
 Prefix the commands below with `uv run`, or activate the environment with
 `source .venv/bin/activate`.
 
@@ -143,6 +147,21 @@ Run selected analyzers too when the analyzer runtime is already provisioned
 ```bash
 lakes recommend path/to/Contract.sol --execute --emit summary
 ```
+
+For a nested entrypoint in an extracted project, specify its import root:
+
+```bash
+lakes recommend /work/input/contracts/Main.sol \
+  --project-root /work/input \
+  --execute --emit summary
+```
+
+The selected file and its transitive Solidity imports are analyzed within that
+project root. Unrelated source files are excluded from the file's profile and
+compiler constraints. The target must be inside the existing project directory.
+Without `--project-root`, a file continues to use its parent directory and a
+directory continues to use itself. The packaged `lakes-runner` command accepts
+the same option.
 
 Outputs are always written under the canonical `LAKES_out/<contract>/`
 directory. A custom `--results-root out` places that canonical tree at

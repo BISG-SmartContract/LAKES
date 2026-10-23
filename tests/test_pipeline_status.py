@@ -183,3 +183,48 @@ def test_execution_sets_overall_status(
     monkeypatch.setattr(engine, "_run_execution_pipeline", fake_execute)
     result = run(tmp_path, execute=True)
     assert result.status == expected
+
+
+def test_project_root_reaches_profile_and_execution_plan(tmp_path, monkeypatch) -> None:
+    analyze_target = contract_profile.analyze_target
+    configure_pipeline(monkeypatch, runtime=2.0)
+    monkeypatch.setattr(contract_profile, "analyze_target", analyze_target)
+    monkeypatch.setattr(contract_profile._complexity, "profile_sources", lambda _s: {})
+    project = tmp_path / "input"
+    (project / "contracts").mkdir(parents=True)
+    (project / "lib").mkdir()
+    entry = project / "contracts/Main.sol"
+    entry.write_text('pragma solidity ^0.8.0; import "../lib/Lib.sol"; contract Main {}')
+    (project / "lib/Lib.sol").write_text("pragma solidity >=0.8.10 <0.8.20; library Lib {}")
+    (project / "Unrelated.sol").write_text("pragma solidity ^0.4.25; contract Unrelated {}")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(engine, "load_openai_client", lambda: object())
+    monkeypatch.setattr(engine, "generate_combination_explanation", lambda **_k: CombinationExplanation(
+        text="The checked plan uses the selected contract and its import closure.",
+        source="LLM", model="fixture", limitations=[],
+    ))
+    plans = []
+
+    def execute(plan, **_kwargs):
+        plans.append(plan)
+        assert plan.target_path == str(entry)
+        assert plan.project_root == str(project)
+        assert plan.runner_command[plan.runner_command.index("--project-root") + 1] == str(project)
+        return plan.model_copy(update={
+            "status": "executed", "return_code": 0,
+            "tool_statuses": {"a": ToolExecutionStatus(status="SUCCESS", return_code=0)},
+            "per_tool_findings": {"a": []},
+        })
+
+    monkeypatch.setattr(engine, "execute_plan", execute)
+    result = engine.run_recommendation(
+        target_path="input/contracts/Main.sol", project_root="input",
+        toolcards_dir=str(tmp_path), run_results_root=str(tmp_path / "results"),
+        execute=True, enable_retrieval=False, emit_stderr=False,
+    )
+    assert result.status == PipelineStatus.EXECUTED
+    assert result.features.file_count == 2
+    assert result.features.execution_input_count == 1
+    assert result.features.primary_solidity_version == "0.8.10"
+    assert len(plans) == 1
+    assert Path(result.lakes_output_dir).name == "Main"
