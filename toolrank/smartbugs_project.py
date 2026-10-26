@@ -16,6 +16,7 @@ import tempfile
 
 from toolrank.source_project import copy_dependency_tree
 from toolrank.solc_range import version_satisfies_solidity_constraint
+from toolrank.smartbugs_solc import install_compiler_guards
 
 
 def select_project_solc_version(
@@ -43,6 +44,19 @@ def select_project_solc_version(
 def _install_project_patches() -> None:
     import sb.docker
     import sb.semantic_version
+
+    try:
+        import sb.solc
+    except ModuleNotFoundError as exc:
+        if exc.name != "sb.solc":
+            raise
+    else:
+        try:
+            from solc_select.services.artifact_manager import ArtifactManager
+        except ModuleNotFoundError:
+            # Older user-provided SmartBugs releases still get serialized path lookup.
+            ArtifactManager = None
+        install_compiler_guards(sb.solc, Path(sb.solc.SOLC_SELECT_DIR), ArtifactManager)
 
     project_root = Path(os.environ["LAKES_PROJECT_ROOT"]).resolve()
     original_volume = sb.docker.__docker_volume

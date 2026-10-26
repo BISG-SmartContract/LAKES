@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import islice
 import os
 from pathlib import Path
 import shutil
@@ -58,21 +59,22 @@ def atomic_write_text(path: str | Path, payload: str) -> None:
             pass
 
 
-def _has_semantic_failure(payload: dict[str, Any]) -> bool:
+def _semantic_failure_detail(payload: dict[str, Any]) -> str:
     analysis = payload.get("analysis")
     scopes = [payload]
     if isinstance(analysis, dict):
         scopes.append(analysis)
+    reasons: list[str] = []
     for scope in scopes:
         success = scope.get("success")
         if success is not None and (
             success is False
             or str(success).strip().lower() in {"false", "0", "no"}
         ):
-            return True
+            reasons.append(f"success={success}")
         for key in ("error", "errors", "fail", "fails", "failures"):
             if scope.get(key):
-                return True
+                reasons.append(f"{key}: {json.dumps(scope[key], ensure_ascii=False)}")
     parser = payload.get("parser")
     parser_status = parser.get("status") if isinstance(parser, dict) else None
     statuses = [parser_status, *(scope.get("status") for scope in scopes)]
@@ -87,10 +89,46 @@ def _has_semantic_failure(payload: dict[str, Any]) -> bool:
         "timed_out",
         "unsupported",
     }
-    return any(
-        str(status or "").strip().lower() in failed_statuses
-        for status in statuses
-    )
+    reasons.extend(f"report status: {status}" for status in statuses
+                   if str(status or "").strip().lower() in failed_statuses)
+    return "; ".join(reasons)
+
+
+def _has_semantic_failure(payload: dict[str, Any]) -> bool:
+    return bool(_semantic_failure_detail(payload))
+
+
+def describe_report_failure(root: str | Path) -> tuple[str, str]:
+    """Explain a rejected invocation without accepting its findings."""
+    path = Path(root)
+    try:
+        candidates = sorted(islice(path.rglob("result.json"), 64)) if path.is_dir() else []
+    except OSError as exc:
+        return "REPORT_UNREADABLE", f"cannot inspect analyzer reports: {exc}"
+    if not candidates:
+        return "REPORT_MISSING", "analyzer did not produce result.json"
+    problems: list[tuple[str, str]] = []
+    for candidate in candidates[:64]:
+        try:
+            with candidate.open("rb") as handle:
+                raw = handle.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                problems.append(("REPORT_INVALID", "rejected report exceeds diagnostic inspection limit"))
+                continue
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            problems.append(("REPORT_INVALID_JSON", f"invalid report JSON: {exc}"))
+            continue
+        except OSError as exc:
+            problems.append(("REPORT_UNREADABLE", f"cannot read analyzer report: {exc}"))
+            continue
+        if isinstance(payload, dict):
+            reason = _semantic_failure_detail(payload)
+            if reason:
+                # Prefer the tool's actual error over a missing/invalid sibling report.
+                return "ANALYZER_ERROR", reason
+        problems.append(("REPORT_INVALID", "report has no supported findings container"))
+    return problems[0]
 
 
 def load_valid_report(path: str | Path) -> dict[str, Any] | None:
@@ -194,13 +232,18 @@ def clear_selected_run_artifacts(
 ) -> bool:
     """Remove every selected artifact that report/status loaders can consume."""
     root = Path(results_root)
+    diagnostics = root / "diagnostics"
+    if diagnostics.is_symlink() and not remove_or_quarantine_tree(diagnostics, quarantine_root):
+        return False
     paths = [root / "tool_run_statuses.json"]
+    paths.append(root / "diagnostics" / "index.json")
     for tool_id in dict.fromkeys(selected_tool_ids):
         paths.extend(
             (
                 root / tool_id,
                 root / f"{tool_id}.json",
                 root / f"{tool_id}.sarif",
+                root / "diagnostics" / tool_id,
             )
         )
     return all(

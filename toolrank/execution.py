@@ -29,6 +29,14 @@ from toolrank.execution_status import (
     aggregate_tool_status_history,
     overall_execution_status,
 )
+from toolrank.execution_diagnostics import (
+    record_failure,
+    record_rejected_report,
+    redact,
+    secret_values,
+    status_from_outcome,
+    write_diagnostic_index,
+)
 from toolrank.report_parser import load_per_tool_findings
 from toolrank.report_validity import (
     OUTPUT_CLEANUP_FAILURE_RETURN_CODE,
@@ -42,6 +50,7 @@ from toolrank.schemas import (
     ExecutionResult,
     ToolArtifactConsumption,
     ToolExecutionStatus,
+    ToolFailureDiagnostic,
 )
 from toolrank.source_project import resolve_project_root
 
@@ -519,24 +528,40 @@ def _native_smartbugs_execute(
 
     resolved_timeout = float(schedule.tool_timeout_seconds)
     vulnerability_mapping = packaged_runner._load_mapping()
+    secrets = secret_values(gptscan_api_key)
 
     def run_tool(tool_id: str):
         commands: List[str] = []
         stdout_chunks: List[str] = []
         stderr_chunks: List[str] = []
         outcomes: list[tuple[str, int]] = []
+        history: list[ToolExecutionStatus] = []
         runtime_seconds = 0.0
         shared_source_succeeded = False
         gptscan_source_dispatched = False
         for target_input in target_inputs:
             contract_path = target_input.path
             input_kind = target_input.kind
+            logical_input_id = packaged_runner._logical_input_id(
+                contract_path, target_path, project_root=project_root,
+            )
+            diagnostics: list[ToolFailureDiagnostic] = []
+
+            def note_failure(code: int, **reason) -> None:
+                diagnostics.append(record_failure(
+                    diagnostics_root=results_root / "diagnostics", tool_id=tool_id,
+                    input_id=logical_input_id, return_code=code,
+                    timeout_seconds=resolved_timeout, secrets=secrets, **reason,
+                ))
+
             if tool_id == "gptscan" and input_kind == "sol":
                 if gptscan_source_dispatched:
                     continue
                 gptscan_source_dispatched = True
             if not adapter_supports_input(tool_id, input_kind):
                 outcomes.append((contract_path.name, 65))
+                note_failure(65)
+                history.append(status_from_outcome(65, diagnostics=diagnostics))
                 stderr_chunks.append(
                     f"[{tool_id}:{contract_path.name}] unsupported input kind: {input_kind}"
                 )
@@ -546,17 +571,15 @@ def _native_smartbugs_execute(
                 if target_path.is_file()
                 else contract_path.relative_to(target_path)
             )
-            logical_input_id = packaged_runner._logical_input_id(
-                contract_path,
-                target_path,
-                project_root=project_root,
-            )
             out_dir = results_root / tool_id / relative
             out_dir.parent.mkdir(parents=True, exist_ok=True)
             if not remove_or_quarantine_tree(out_dir, quarantine_root):
                 outcomes.append(
                     (contract_path.name, OUTPUT_CLEANUP_FAILURE_RETURN_CODE)
                 )
+                note_failure(OUTPUT_CLEANUP_FAILURE_RETURN_CODE,
+                             failure_code="OUTPUT_CLEANUP_FAILED", detail="output cleanup failed")
+                history.append(status_from_outcome(OUTPUT_CLEANUP_FAILURE_RETURN_CODE, diagnostics=diagnostics))
                 stderr_chunks.append(
                     f"[{tool_id}:{contract_path.name}] output cleanup failed"
                 )
@@ -589,9 +612,12 @@ def _native_smartbugs_execute(
                     input_kind=input_kind,
                     compilation_bundle=compilation_bundle,
                     logical_input_id=logical_input_id,
+                    diagnostics_root=results_root / "diagnostics",
+                    diagnostics=diagnostics,
                 )
                 runtime_seconds += time.monotonic() - started
                 outcomes.append((contract_path.name, returncode))
+                history.append(status_from_outcome(returncode, diagnostics=diagnostics))
                 if (
                     returncode == 0
                     and uses_shared_source_artifact
@@ -638,14 +664,25 @@ def _native_smartbugs_execute(
                         )
                 except (OSError, RuntimeError) as exc:
                     outcomes.append((contract_path.name, 1))
+                    note_failure(1, staged_root=staged_out,
+                                 failure_code="INPUT_PREPARATION_FAILED", detail=f"{type(exc).__name__}: {exc}")
+                    history.append(status_from_outcome(1, diagnostics=diagnostics))
                     stderr_chunks.append(
-                        f"[{tool_id}:{contract_path.name}] input preparation failed: {exc}"
+                        f"[{tool_id}:{contract_path.name}] input preparation failed: {diagnostics[-1].detail}"
                     )
                     continue
                 effective_returncode = 124 if completed.timed_out else completed.returncode
                 if effective_returncode == 0:
                     report_path = packaged_runner._find_result_json(staged_out)
-                    if report_path is None or not packaged_runner._write_enriched_report(
+                    if report_path is None:
+                        effective_returncode = 1
+                        diagnostics.append(record_rejected_report(
+                            diagnostics_root=results_root / "diagnostics", tool_id=tool_id,
+                            input_id=logical_input_id, return_code=1,
+                            timeout_seconds=resolved_timeout, staged_root=staged_out,
+                            stdout=completed.stdout, stderr=completed.stderr, secrets=secrets,
+                        ))
+                    elif not packaged_runner._write_enriched_report(
                         report_path,
                         tool_id,
                         vulnerability_mapping,
@@ -656,6 +693,8 @@ def _native_smartbugs_execute(
                         ),
                     ):
                         effective_returncode = 1
+                        note_failure(1, staged_root=staged_out, stdout=completed.stdout, stderr=completed.stderr,
+                                     failure_code="REPORT_ENRICHMENT_FAILED", detail="report enrichment failed")
                     elif not promote_valid_report_tree(
                         staged_out,
                         out_dir,
@@ -666,27 +705,25 @@ def _native_smartbugs_execute(
                             if out_dir.exists()
                             else 1
                         )
+                        note_failure(effective_returncode, staged_root=staged_out,
+                                     stdout=completed.stdout, stderr=completed.stderr,
+                                     failure_code="REPORT_PROMOTION_FAILED", detail="report promotion failed")
+                if effective_returncode != 0 and not diagnostics:
+                    note_failure(effective_returncode, staged_root=staged_out,
+                                 stdout=completed.stdout, stderr=completed.stderr)
             runtime_seconds += completed.elapsed_seconds
             outcomes.append((contract_path.name, effective_returncode))
+            history.append(status_from_outcome(effective_returncode, diagnostics=diagnostics))
             if completed.stdout:
                 stdout_chunks.append(
-                    f"[{tool_id}:{contract_path.name}]\n{completed.stdout[-2000:]}"
+                    f"[{tool_id}:{contract_path.name}]\n{redact(completed.stdout, secrets)[-2000:]}"
                 )
             if completed.stderr:
                 stderr_chunks.append(
-                    f"[{tool_id}:{contract_path.name}]\n{completed.stderr[-2000:]}"
+                    f"[{tool_id}:{contract_path.name}]\n{redact(completed.stderr, secrets)[-2000:]}"
                 )
 
-        status = aggregate_tool_status_history(
-            [
-                ToolExecutionStatus(
-                    status="SUCCESS" if code == 0 else "TIMEOUT" if code == 124 else "FAIL",
-                    runtime_minutes=None,
-                    return_code=code,
-                )
-                for _filename, code in outcomes
-            ]
-        )
+        status = aggregate_tool_status_history(history)
         consumption = compilation_bundle.tool_consumption.get(tool_id)
         if consumption is not None:
             consumption = consumption.model_copy(
@@ -705,7 +742,19 @@ def _native_smartbugs_execute(
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(run_tool, tool): tool for tool in selected_tools}
         for future in as_completed(futures):
-            tool_results[futures[future]] = future.result()
+            tool_id = futures[future]
+            try:
+                tool_results[tool_id] = future.result()
+            except Exception as exc:
+                diagnostic = record_failure(
+                    diagnostics_root=results_root / "diagnostics", tool_id=tool_id,
+                    input_id=target_path.name, return_code=1, timeout_seconds=resolved_timeout,
+                    failure_code="ADAPTER_EXCEPTION", detail=f"{type(exc).__name__}: {exc}", secrets=secrets,
+                )
+                tool_results[tool_id] = (
+                    [], [], [diagnostic.detail], [(target_path.name, 1)],
+                    status_from_outcome(1, diagnostics=[diagnostic]),
+                )
 
     native_commands: List[str] = []
     combined_stdout: List[str] = []
@@ -722,6 +771,7 @@ def _native_smartbugs_execute(
             if returncode != 0:
                 failures.append(f"{tool_id}:{filename}:{returncode}")
 
+    write_diagnostic_index(results_root, statuses)
     (results_root / "tool_run_statuses.json").write_text(
         json.dumps(
             {

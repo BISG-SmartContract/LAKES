@@ -20,7 +20,9 @@ def test_analyzer_failure_builds_typed_status_without_none_detail(
     monkeypatch,
 ) -> None:
     def fail(tool_name, contract_path, **kwargs):
-        return runner._map_tool_name(tool_name), 2, 0.25
+        return runner._map_tool_name(tool_name), ToolExecutionStatus(
+            status="FAIL", return_code=2, runtime_minutes=0.25,
+        )
 
     monkeypatch.setattr(runner, "_run_one_tool_for_contract", fail)
     tools = ["slither"] if jobs == 1 else ["slither", "mythril"]

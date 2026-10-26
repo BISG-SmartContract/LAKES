@@ -41,7 +41,7 @@ def test_every_runner_adapter_uses_the_shared_outer_deadline(
 
     monkeypatch.setattr(runner, "_run_adapter_with_deadline", fake_deadline)
 
-    _tool, rc, _runtime = runner._run_one_tool_for_contract(
+    _tool, status = runner._run_one_tool_for_contract(
         tool_id,
         target,
         target_root=target,
@@ -55,7 +55,7 @@ def test_every_runner_adapter_uses_the_shared_outer_deadline(
         quarantine_root=tmp_path / ".quarantine",
     )
 
-    assert rc == 0
+    assert status.return_code == 0
     assert calls[0]["tool"] == tool_id
     assert calls[0]["timeout"] == 13
     assert calls[0]["gptscan_timeout"] == 7
@@ -166,6 +166,7 @@ def test_hanging_adapter_is_killed_and_cannot_write_a_late_result(
     )
     executable.chmod(0o755)
 
+    diagnostics = []
     rc = runner._run_adapter_with_deadline(
         "mythril",
         target,
@@ -177,9 +178,13 @@ def test_hanging_adapter_is_killed_and_cannot_write_a_late_result(
         openai_api_key="",
         openai_api_base="",
         quarantine_root=tmp_path / ".quarantine",
+        diagnostics=diagnostics,
     )
 
     assert rc == 124
+    assert diagnostics[0].failure_code == "TOOL_TIMEOUT"
+    evidence = out_dir.parent / diagnostics[0].directory
+    assert (evidence / "worker.stdout.log").is_file()
     assert marker.exists()
     time.sleep(0.7)
     assert not (out_dir / "result.json").exists()

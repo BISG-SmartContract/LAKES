@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
@@ -43,6 +43,15 @@ from toolrank.compilation import (
     write_compilation_manifest,
 )
 from toolrank.execution_status import aggregate_tool_status_history
+from toolrank.execution_diagnostics import (
+    capture_worker_logs,
+    record_failure,
+    record_rejected_report,
+    redact,
+    secret_values,
+    status_from_outcome,
+    write_diagnostic_index,
+)
 from toolrank.fusion import compact_fused_report_payload, fuse_reports
 from toolrank.openai_compat import (
     DEFAULT_DEEPSEEK_BASE_URL,
@@ -69,7 +78,7 @@ from toolrank.runner_adapter import (
     _map_tool_name,
     _parse_tools,
 )
-from toolrank.schemas import CompositionPlan, FusedReport, ToolExecutionStatus
+from toolrank.schemas import CompositionPlan, FusedReport, ToolExecutionStatus, ToolFailureDiagnostic
 from toolrank.source_project import (
     copy_dependency_tree,
     dependency_closure,
@@ -1260,6 +1269,18 @@ def _adapter_worker_main() -> int:
     """Run one adapter in an isolated process group from a private stdin request."""
     try:
         request = json.load(sys.stdin)
+    except (ValueError, OSError) as exc:
+        print(f"[warn] adapter worker request failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    secrets = secret_values(str(request.get("openai_api_key") or ""))
+    log_directory = request.get("diagnostic_log_directory")
+    context = capture_worker_logs(Path(log_directory), secrets) if log_directory else nullcontext()
+    with context:
+        return _adapter_worker_request(request, secrets)
+
+
+def _adapter_worker_request(request: dict, secrets: Sequence[str]) -> int:
+    try:
         ready_path = request.get("ready_path")
         if ready_path:
             Path(ready_path).touch()
@@ -1295,7 +1316,7 @@ def _adapter_worker_main() -> int:
         )
     except Exception as exc:
         print(
-            f"[warn] adapter worker failed: {type(exc).__name__}",
+            redact(f"[warn] adapter worker failed: {type(exc).__name__}: {exc}", secrets),
             file=sys.stderr,
         )
         return 1
@@ -1335,11 +1356,28 @@ def _run_adapter_with_deadline(
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
     project_root: Path | None = None,
+    diagnostics_root: Path | None = None,
+    diagnostics: list[ToolFailureDiagnostic] | None = None,
 ) -> int:
     """Enforce one outer deadline around the complete adapter implementation."""
+    secrets = secret_values(openai_api_key)
+    evidence_root = diagnostics_root or out_dir.parent / "diagnostics"
+    input_id = logical_input_id or _logical_input_id(contract_path, target_root, project_root=project_root)
+
+    def failed(code: int, *, staged_root=None, log_directory=None, **reason) -> int:
+        diagnostic = record_failure(
+            diagnostics_root=evidence_root, tool_id=tool_id, input_id=input_id,
+            return_code=code, timeout_seconds=timeout, staged_root=staged_root,
+            log_directory=log_directory, secrets=secrets, **reason,
+        )
+        if diagnostics is not None:
+            diagnostics.append(diagnostic)
+        print(f"[warn] tool={tool_id} {diagnostic.failure_code}: {diagnostic.detail}", file=sys.stderr)
+        return code
+
     if not remove_or_quarantine_tree(out_dir, quarantine_root):
         print(f"[warn] output cleanup failed tool={tool_id}", file=sys.stderr)
-        return OUTPUT_CLEANUP_FAILURE_RETURN_CODE
+        return failed(OUTPUT_CLEANUP_FAILURE_RETURN_CODE, failure_code="OUTPUT_CLEANUP_FAILED", detail="output cleanup failed")
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"lakes_{tool_id}_attempt_") as tmp:
         staged_out = Path(tmp) / "result"
@@ -1360,6 +1398,7 @@ def _run_adapter_with_deadline(
             "ready_path": str(ready_path),
             "input_kind": input_kind or classify_target_input(contract_path) or "sol",
             "logical_input_id": logical_input_id,
+            "diagnostic_log_directory": tmp,
         }
         if compilation_bundle is not None:
             request["compilation_bundle"] = compilation_bundle.model_dump(mode="json")
@@ -1374,27 +1413,39 @@ def _run_adapter_with_deadline(
                 gptscan_model.strip() or _resolve_gptscan_model()
             )
         command = [sys.executable, "-m", "toolrank.runner", _ADAPTER_WORKER_ARG]
-        completed = run_process_with_deadline(
-            command,
-            timeout_seconds=timeout,
-            cwd=_REPO_ROOT,
-            input_text=json.dumps(request),
-            capture_output=False,
-            display_command=command,
-            ready_file=ready_path,
-            env=_sanitized_adapter_env(),
-        )
+        try:
+            completed = run_process_with_deadline(
+                command,
+                timeout_seconds=timeout,
+                cwd=_REPO_ROOT,
+                input_text=json.dumps(request),
+                capture_output=False,
+                display_command=command,
+                ready_file=ready_path,
+                env=_sanitized_adapter_env(),
+            )
+        except OSError as exc:
+            return failed(1, staged_root=staged_out, log_directory=Path(tmp),
+                          failure_code="PROCESS_START_FAILED", detail=str(exc))
         if completed.timed_out:
             print(
                 f"[warn] outer tool timeout tool={tool_id} timeout_seconds={timeout}",
                 file=sys.stderr,
             )
-            return 124
+            return failed(124, staged_root=staged_out, log_directory=Path(tmp))
         if completed.returncode != 0:
-            return completed.returncode
+            return failed(completed.returncode, staged_root=staged_out, log_directory=Path(tmp))
         result_path = find_valid_report(staged_out)
         if result_path is None:
             print(f"[warn] invalid current-run report tool={tool_id}", file=sys.stderr)
+            diagnostic = record_rejected_report(
+                diagnostics_root=evidence_root, tool_id=tool_id, input_id=input_id,
+                return_code=1, timeout_seconds=timeout, staged_root=staged_out,
+                log_directory=Path(tmp), secrets=secrets,
+            )
+            if diagnostics is not None:
+                diagnostics.append(diagnostic)
+            print(f"[warn] tool={tool_id} {diagnostic.failure_code}: {diagnostic.detail}", file=sys.stderr)
             return 1
         input_filename = (
             str(contract_path.resolve())
@@ -1403,17 +1454,20 @@ def _run_adapter_with_deadline(
         )
         if not _write_enriched_report(result_path, tool_id, mapping or {}, input_filename):
             print(f"[warn] report enrichment failed tool={tool_id}", file=sys.stderr)
-            return 1
+            return failed(1, staged_root=staged_out, log_directory=Path(tmp),
+                          failure_code="REPORT_ENRICHMENT_FAILED", detail="report enrichment failed")
         if not promote_valid_report_tree(
             staged_out,
             out_dir,
             quarantine_root=quarantine_root,
         ):
             print(f"[warn] report promotion failed tool={tool_id}", file=sys.stderr)
-            return (
+            return failed(
                 OUTPUT_CLEANUP_FAILURE_RETURN_CODE
                 if out_dir.exists()
-                else 1
+                else 1,
+                staged_root=staged_out, log_directory=Path(tmp),
+                failure_code="REPORT_PROMOTION_FAILED", detail="report promotion failed",
             )
         return 0
 
@@ -1435,12 +1489,13 @@ def _run_one_tool_for_contract(
     compilation_bundle: Stage3CompilationBundle | None = None,
     logical_input_id: str | None = None,
     project_root: Path | None = None,
-) -> tuple[str, int, float]:
+) -> tuple[str, ToolExecutionStatus]:
     rel = _relative_contract_path(contract_path, target_root)
     tool_id = _map_tool_name(tool_name)
     out_dir = results_root / tool_id / rel
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    diagnostics: list[ToolFailureDiagnostic] = []
     rc = _run_adapter_with_deadline(
         tool_id,
         contract_path,
@@ -1457,20 +1512,26 @@ def _run_one_tool_for_contract(
         compilation_bundle=compilation_bundle,
         logical_input_id=logical_input_id,
         project_root=project_root,
+        diagnostics_root=results_root / "diagnostics",
+        diagnostics=diagnostics,
     )
     if rc != 0:
         print(f"[warn] tool run failed tool={tool_id} exit_code={rc}", file=sys.stderr)
-        return tool_id, rc, (time.monotonic() - started) / 60.0
+        return tool_id, status_from_outcome(rc, (time.monotonic() - started) / 60.0, diagnostics)
     result_path = _find_result_json(out_dir)
     if result_path is None or not _write_enriched_report(result_path, tool_id, mapping):
-        cleanup_ok = remove_or_quarantine_tree(out_dir, quarantine_root)
         print(f"[warn] result.json missing or invalid for tool={tool_id}", file=sys.stderr)
-        return (
-            tool_id,
-            1 if cleanup_ok else OUTPUT_CLEANUP_FAILURE_RETURN_CODE,
-            (time.monotonic() - started) / 60.0,
+        diagnostic = record_failure(
+            diagnostics_root=results_root / "diagnostics", tool_id=tool_id,
+            input_id=logical_input_id or _logical_input_id(contract_path, target_root, project_root=project_root),
+            return_code=1, timeout_seconds=timeout, staged_root=out_dir,
+            failure_code="REPORT_ENRICHMENT_FAILED", detail="promoted result.json missing or invalid",
+            secrets=secret_values(openai_api_key),
         )
-    return tool_id, 0, (time.monotonic() - started) / 60.0
+        cleanup_ok = remove_or_quarantine_tree(out_dir, quarantine_root)
+        code = 1 if cleanup_ok else OUTPUT_CLEANUP_FAILURE_RETURN_CODE
+        return tool_id, status_from_outcome(code, (time.monotonic() - started) / 60.0, [diagnostic])
+    return tool_id, status_from_outcome(0, (time.monotonic() - started) / 60.0)
 
 
 def _run_one_contract(
@@ -1494,49 +1555,54 @@ def _run_one_contract(
 ) -> tuple[int, dict[str, ToolExecutionStatus]]:
     exit_code = 0
     statuses: dict[str, ToolExecutionStatus] = {}
+
+    def collect(tool_id: str, status: ToolExecutionStatus) -> None:
+        nonlocal exit_code
+        statuses[tool_id] = status
+        code = status.return_code or 0
+        if code:
+            exit_code = (
+                OUTPUT_CLEANUP_FAILURE_RETURN_CODE
+                if OUTPUT_CLEANUP_FAILURE_RETURN_CODE in {code, exit_code}
+                else code
+            )
+
+    def crashed(tool_name: str, exc: Exception) -> tuple[str, ToolExecutionStatus]:
+        tool_id = _map_tool_name(tool_name)
+        diagnostic = record_failure(
+            diagnostics_root=results_root / "diagnostics", tool_id=tool_id,
+            input_id=logical_input_id or _logical_input_id(contract_path, target_root, project_root=project_root),
+            return_code=1, timeout_seconds=timeout,
+            failure_code="ADAPTER_EXCEPTION", detail=f"{type(exc).__name__}: {exc}",
+            secrets=secret_values(openai_api_key),
+        )
+        print(f"[warn] tool run crashed tool={tool_name} error={diagnostic.detail}", file=sys.stderr)
+        return tool_id, status_from_outcome(1, diagnostics=[diagnostic])
+
     if jobs <= 1 or len(selected_tools) <= 1:
         for tool_name in selected_tools:
-            _tool_id, rc, runtime_minutes = _run_one_tool_for_contract(
-                tool_name,
-                contract_path,
-                target_root=target_root,
-                results_root=results_root,
-                mapping=mapping,
-                smartbugs_dir=smartbugs_dir,
-                timeout=timeout,
-                gptscan_timeout=gptscan_timeout,
-                openai_api_key=openai_api_key,
-                openai_api_base=openai_api_base,
-                quarantine_root=quarantine_root,
-                input_kind=input_kind,
-                compilation_bundle=compilation_bundle,
-                logical_input_id=logical_input_id,
-                project_root=project_root,
-            )
-            if rc != 0:
-                exit_code = (
-                    OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                    if rc == OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                    or exit_code == OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                    else rc
+            try:
+                tool_id, status = _run_one_tool_for_contract(
+                    tool_name,
+                    contract_path,
+                    target_root=target_root,
+                    results_root=results_root,
+                    mapping=mapping,
+                    smartbugs_dir=smartbugs_dir,
+                    timeout=timeout,
+                    gptscan_timeout=gptscan_timeout,
+                    openai_api_key=openai_api_key,
+                    openai_api_base=openai_api_base,
+                    quarantine_root=quarantine_root,
+                    input_kind=input_kind,
+                    compilation_bundle=compilation_bundle,
+                    logical_input_id=logical_input_id,
+                    project_root=project_root,
                 )
-                statuses[_tool_id] = ToolExecutionStatus(
-                    status="TIMEOUT" if rc == 124 else "FAIL",
-                    runtime_minutes=runtime_minutes,
-                    return_code=rc,
-                    detail=(
-                        "output cleanup failed"
-                        if rc == OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                        else ""
-                    ),
-                )
-            else:
-                statuses[_tool_id] = ToolExecutionStatus(
-                    status="SUCCESS",
-                    runtime_minutes=runtime_minutes,
-                    return_code=0,
-                )
-            if rc == OUTPUT_CLEANUP_FAILURE_RETURN_CODE:
+            except Exception as exc:
+                tool_id, status = crashed(tool_name, exc)
+            collect(tool_id, status)
+            if status.return_code == OUTPUT_CLEANUP_FAILURE_RETURN_CODE:
                 break
         return exit_code, statuses
 
@@ -1567,38 +1633,10 @@ def _run_one_contract(
         for future in as_completed(futures):
             tool_name = futures[future]
             try:
-                _tool_id, rc, runtime_minutes = future.result()
+                tool_id, status = future.result()
             except Exception as exc:  # pragma: no cover - defensive guard around external tools.
-                print(f"[warn] tool run crashed tool={tool_name} error={exc}", file=sys.stderr)
-                if exit_code != OUTPUT_CLEANUP_FAILURE_RETURN_CODE:
-                    exit_code = 1
-                statuses[_map_tool_name(tool_name)] = ToolExecutionStatus(
-                    status="FAIL", return_code=1, detail=str(exc)
-                )
-                continue
-            if rc != 0:
-                exit_code = (
-                    OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                    if rc == OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                    or exit_code == OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                    else rc
-                )
-                statuses[_tool_id] = ToolExecutionStatus(
-                    status="TIMEOUT" if rc == 124 else "FAIL",
-                    runtime_minutes=runtime_minutes,
-                    return_code=rc,
-                    detail=(
-                        "output cleanup failed"
-                        if rc == OUTPUT_CLEANUP_FAILURE_RETURN_CODE
-                        else ""
-                    ),
-                )
-            else:
-                statuses[_tool_id] = ToolExecutionStatus(
-                    status="SUCCESS",
-                    runtime_minutes=runtime_minutes,
-                    return_code=0,
-                )
+                tool_id, status = crashed(tool_name, exc)
+            collect(tool_id, status)
     return exit_code, statuses
 
 
@@ -1637,6 +1675,7 @@ def _write_tool_status_manifest(
     statuses: dict[str, ToolExecutionStatus],
 ) -> None:
     results_root.mkdir(parents=True, exist_ok=True)
+    write_diagnostic_index(results_root, statuses)
     (results_root / "tool_run_statuses.json").write_text(
         json.dumps(
             {

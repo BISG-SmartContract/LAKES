@@ -173,6 +173,28 @@ does not add another nested `LAKES_out`.
 - `fused_report.json` preserves source tools, raw findings, field variants, and conflicts.
 - `execution.json` records the runner invocation and execution result.
 
+Failed analyzer inputs retain diagnostic evidence under the run's raw-results
+directory at `diagnostics/<tool>/<input-id>/`, separately from reports consumed
+by fusion. `diagnostics/index.json` lists the failed inputs and their evidence
+directories. Each input's `diagnostic.json` records its failure classification,
+exit code, outer timeout, saved files, and any truncation or omitted files.
+Evidence includes available original reports, analyzer logs and run metadata;
+worker output is retained even when the outer deadline terminates the worker.
+Text files are capped at 1 MiB and copied diagnostic content at 32 MiB per run.
+Known credentials are redacted, and symbolic links are not followed.
+
+Tool statuses expose `failure_code` and `diagnostics` in addition to the existing
+`status`, `return_code`, and `detail` fields. Specific analyzer errors survive
+single-input and multi-input aggregation, including partial execution; a failed
+report is never treated as an empty successful result. Diagnostic storage errors
+are reported separately without replacing the original tool outcome. Reusing an
+output directory clears diagnostics for the selected tools before execution.
+
+Parallel SmartBugs analyzers share a process lock around compiler preparation.
+Compiler downloads are checksum-verified in private temporary files and then
+published atomically, so another analyzer cannot copy an incomplete compiler.
+The same guards are installed in spawned SmartBugs workers.
+
 ## Docker
 
 Docker includes the analyzer runtime and compiler setup. A fresh image builds

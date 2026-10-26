@@ -704,6 +704,20 @@ class CompositionPlan(BaseModel):
         return self
 
 
+class ToolFailureDiagnostic(BaseModel):
+    """One failed input, with evidence kept outside consumable tool reports."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_id: str
+    failure_code: str
+    detail: str
+    return_code: int
+    directory: str | None = None
+    truncated: bool = False
+    preservation_error: str = ""
+
+
 class ToolExecutionStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -712,6 +726,8 @@ class ToolExecutionStatus(BaseModel):
     return_code: Optional[int] = None
     detail: str = ""
     artifact_consumption: ToolArtifactConsumption | None = None
+    failure_code: str = ""
+    diagnostics: List[ToolFailureDiagnostic] = Field(default_factory=list)
 
 
 class ExecutionResult(BaseModel):
