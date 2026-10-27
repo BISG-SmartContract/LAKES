@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 
 from toolrank.execution import build_execution_plan
@@ -38,4 +39,4 @@ def test_execution_plan_runs_additive_owners_in_parallel(tmp_path) -> None:
     assert category_arg == "b:REENTRANCY"
     assert result.selected_tool_solc_ranges == {"a": "0.8.x", "b": ">=0.7.0"}
     ranges_arg = result.runner_command[result.runner_command.index("--tool-solc-ranges") + 1]
-    assert ranges_arg == '{"a":"0.8.x","b":">=0.7.0"}'
+    assert json.loads(ranges_arg) == {"a": "0.8.x", "b": ">=0.7.0"}

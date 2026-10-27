@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
+
+import pytest
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+
+from tests.release_helpers import (
+    bind_mounts,
+    docker_copy,
+    docker_instructions,
+    documented_docker_runs,
+    host_path,
+    option_value,
+)
+from toolrank.report_validity import atomic_write_text, canonical_contract_output_dir
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +102,10 @@ def test_fresh_wheel_contains_default_toolcards_and_cli_resolves_them(
     }
     with zipfile.ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
+        entry_points = configparser.ConfigParser()
+        entry_points_path = next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
+        entry_points.read_string(archive.read(entry_points_path).decode())
+        assert "lakes-profile-builder" in entry_points["console_scripts"]
         packaged_toolcard_files = {
             name
             for name in names
@@ -107,12 +129,18 @@ def test_fresh_wheel_contains_default_toolcards_and_cli_resolves_them(
                 "from pathlib import Path; "
                 "from toolrank.cli import _DEFAULT_TOOLCARDS_DIR; "
                 "root=Path(_DEFAULT_TOOLCARDS_DIR); "
-                "assert root == Path(__import__('toolcards').__file__).parent; "
+                "assert root.resolve() == Path(__import__('toolcards').__file__).parent.resolve(); "
                 "assert (root/'performance_db.json').is_file(); "
                 "assert (root/'contract_profiles.json').is_file(); "
                 "assert (root/'contract_profile_manifest.json').is_file(); "
                 "assert (root/'passage_store.json').is_file(); "
-                "assert (root/'vector_index'/'index.json').is_file()"
+                "assert (root/'vector_index'/'index.json').is_file(); "
+                "import importlib.metadata as metadata; import sys; "
+                "distribution = next(dist for dist in metadata.distributions(path=[str(root.parent)]) "
+                "if dist.metadata['Name'] == 'lakes'); "
+                "entry_point = next(ep for ep in distribution.entry_points "
+                "if ep.group == 'console_scripts' and ep.name == 'lakes-profile-builder'); "
+                "sys.argv = [entry_point.name, '--help']; entry_point.load()()"
             ),
         ],
         cwd=tmp_path,
@@ -124,6 +152,8 @@ def test_fresh_wheel_contains_default_toolcards_and_cli_resolves_them(
         text=True,
     )
     assert probe.returncode == 0, probe.stdout + probe.stderr
+    for option in ("--corpus-root", "--manifest", "--output"):
+        assert option in probe.stdout
 
 
 def test_fresh_tracked_checkout_execute_publishes_one_canonical_tree(
@@ -336,13 +366,24 @@ assert "Old.sol" not in fused
     assert probe.returncode == 0, probe.stdout + probe.stderr
 
 
-def test_readme_clean_checkout_execution_uses_canonical_host_directory() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    assert "python -m pip install -e ." in readme
-    assert '-v "$PWD/LAKES_out:/work/LAKES_out"' in readme
-    assert "--results-root /work/LAKES_out" in readme
-    assert '-v "$PWD/out:/work/out"' not in readme
+def test_readme_execution_publishes_to_writable_canonical_host_directory(tmp_path) -> None:
+    workspace = tmp_path / "checkout with spaces"
+    workspace.mkdir()
+    runs = documented_docker_runs((ROOT / "README.md").read_text(), workspace)
+    executions = [argv for argv in runs if "recommend" in argv and "--execute" in argv]
+    assert executions, "README should demonstrate analyzer execution"
+    for argv in executions:
+        target = argv[argv.index("recommend") + 1]
+        results_root = option_value(argv, "--results-root") or "/work/LAKES_out"
+        mounts = bind_mounts(argv)
+        container_output = canonical_contract_output_dir(results_root, target)
+        output = host_path(container_output, mounts)
+        expected = canonical_contract_output_dir(host_path(results_root, mounts), target)
+        assert output == expected
+        assert output.resolve().is_relative_to(workspace.resolve())
+        assert output.resolve().relative_to(workspace.resolve()).parts.count("LAKES_out") == 1
+        atomic_write_text(output / "fused_report.json", '{"findings": []}\n')
+        assert json.loads((expected / "fused_report.json").read_text()) == {"findings": []}
 
 
 def test_public_profile_artifacts_are_manifest_and_audit_digest_bound() -> None:
@@ -367,85 +408,154 @@ def test_public_profile_artifacts_are_manifest_and_audit_digest_bound() -> None:
     )
 
 
-def test_docker_builds_smartian_from_tracked_source_with_pinned_dependencies() -> None:
-    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
-    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-    smartian_runner = (
-        ROOT / "docker" / "runners" / "run_smartian.py"
-    ).read_text(encoding="utf-8")
-    gptscan_requirements = (
-        ROOT / "docker" / "vendor" / "gptscan" / "requirements-docker.txt"
-    ).read_text(encoding="utf-8")
-    dockerignore_entries = {
-        line.strip()
-        for line in dockerignore.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
+def test_release_build_uses_immutable_dependency_revisions() -> None:
+    instructions = docker_instructions((ROOT / "Dockerfile").read_text())
+    defaults = dict(value.split("=", 1) for kind, value in instructions if kind == "ARG" and "=" in value)
+    for name in ("SMARTIAN_REF", "SMARTBUGS_REF", "FALCON_REF"):
+        values = shlex.split(defaults[name])
+        assert len(values) == 1 and re.fullmatch(r"[0-9a-fA-F]{40}", values[0]), name
 
-    assert "build/" in dockerignore_entries
-    assert "docker/vendor/smartian/build/" in dockerignore
-    assert "toolcards/.private/" in dockerignore
-    assert "toolcards/.private/" in gitignore
-    tracked_private = subprocess.run(
-        ["git", "ls-files", "--", "toolcards/.private"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert tracked_private.stdout == ""
-    assert "ARG LAKES_IMAGE_PLATFORM=$BUILDPLATFORM" in dockerfile
-    assert "ARG SMARTIAN_REF=" in dockerfile
-    assert "ARG FALCON_REF=" in dockerfile
-    assert "FROM --platform=$BUILDPLATFORM" in dockerfile
-    assert "git clone --no-checkout" in dockerfile
-    assert "nethermind EVMAnalysis/B2R2" in dockerfile
-    assert "src/Dirichlet src/rocksdb-sharp" in dockerfile
-    assert "submodule update --init --recursive" not in dockerfile
-    assert "--runtime \"${smartian_runtime}\"" in dockerfile
-    assert "COPY --from=smartian-builder" in dockerfile
-    assert "rm -rf /tmp/smartian-build" in dockerfile
-    assert "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1" in dockerfile
-    assert (
-        "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \\\n"
-        "        /opt/dotnet/dotnet"
-    ) in dockerfile
-    assert "dpkg --add-architecture amd64" in dockerfile
-    assert "libc6:amd64 libstdc++6:amd64" in dockerfile
-    assert "solc --version" in dockerfile
-    assert "qemu-user-static" not in dockerfile
-    assert "falcon_z3_version=4.13.0.0" in dockerfile
-    assert "git -C /tmp/falcon-metatrust checkout --detach" in dockerfile
-    assert "pip install --no-deps" in dockerfile
-    assert "pip install --retries 5 --timeout 120 -e ." in dockerfile
-    assert "z3-solver==4.11.2.0" in gptscan_requirements
-    assert "crytic-compile==0.3.3" in gptscan_requirements
-    assert "pysha3==1.0.2" in gptscan_requirements
-    assert "falcon-analyzer@git+" not in gptscan_requirements
-    assert '_ensure_executable(args.dotnet, "--info")' in smartian_runner
-    assert '_ensure_executable(args.dotnet, "--version")' not in smartian_runner
-    assert "docker/vendor/smartian/src" in dockerfile
-    assert (
-        "dotnet build /work/docker/vendor/smartian/src/Smartian.fsproj"
-        in dockerfile
-    )
-    assert "/tmp/smartian-build/src/Smartian.fsproj" not in dockerfile
-    assert "test -s /work/docker/vendor/smartian/build/Smartian.dll" in dockerfile
-    assert (
-        "test -s /work/docker/vendor/smartian/src/Agent/AttackerContract.bin"
-        in dockerfile
-    )
-    assert "/Users/" not in dockerfile
-    assert "COPY docker/vendor/smartian/build" not in dockerfile
 
-    project = (
-        ROOT / "docker" / "vendor" / "smartian" / "src" / "Smartian.fsproj"
-    ).read_text(encoding="utf-8")
-    assert "..\\nethermind\\" in project
-    assert "..\\EVMAnalysis\\" in project
-    assert "Nethermind.Logging.csproj" in project
-    assert "Nethermind.Store.csproj" in project
-    assert 'PackageReference Include="MathNet.Numerics.FSharp"' in project
-    assert not (ROOT / "docker" / "vendor" / "smartian" / "nethermind").exists()
-    assert not (ROOT / "docker" / "vendor" / "smartian" / "EVMAnalysis").exists()
+def test_release_smartian_artifacts_come_from_a_build_stage() -> None:
+    instructions = docker_instructions((ROOT / "Dockerfile").read_text())
+    stages = {}
+    for kind, value in instructions:
+        if kind == "FROM":
+            words = shlex.split(value)
+            if "AS" in [word.upper() for word in words]:
+                index = next(i for i, word in enumerate(words) if word.upper() == "AS")
+                stages[words[index + 1]] = words[:index]
+    artifact_copies = []
+    for kind, value in instructions:
+        if kind != "COPY":
+            continue
+        options, paths = docker_copy(value)
+        if "from" not in options:
+            assert all(not PurePosixPath(source).is_absolute() for source in paths[:-1])
+            assert not any(
+                PurePosixPath(source).as_posix().rstrip("/").endswith("smartian/build")
+                for source in paths[:-1]
+            )
+        if PurePosixPath(paths[-1]) == PurePosixPath("/work/docker/vendor/smartian/build"):
+            artifact_copies.append((options, paths))
+    assert artifact_copies
+    for options, paths in artifact_copies:
+        assert options.get("from") in stages
+        stage = stages[options["from"]]
+        platform = next(word.split("=", 1)[1] for word in stage if word.startswith("--platform="))
+        assert platform.replace("${BUILDPLATFORM}", "$BUILDPLATFORM") == "$BUILDPLATFORM"
+        assert PurePosixPath(paths[0]) == PurePosixPath("/work/docker/vendor/smartian/build")
+
+
+def test_smartian_project_resolves_tracked_source_and_declared_dependencies() -> None:
+    project = ROOT / "docker/vendor/smartian/src/Smartian.fsproj"
+    tree = ET.parse(project)
+    sources = [node.attrib["Include"] for node in tree.findall(".//Compile")]
+    assert sources
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", "docker/vendor/smartian"],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
+    for source in sources:
+        path = project.parent.joinpath(*PureWindowsPath(source).parts)
+        assert path.is_file()
+        assert path.relative_to(ROOT).as_posix() in tracked
+    for dependency in ("nethermind", "EVMAnalysis"):
+        assert not any(path.startswith(f"docker/vendor/smartian/{dependency}/") for path in tracked)
+    references = {PureWindowsPath(node.attrib["Include"]).as_posix() for node in tree.findall(".//ProjectReference")}
+    assert any(path.startswith("../nethermind/") for path in references)
+    assert any(path.startswith("../EVMAnalysis/") for path in references)
+    assert {PurePosixPath(path).name for path in references} >= {"Nethermind.Logging.csproj", "Nethermind.Store.csproj"}
+    packages = {node.attrib["Include"]: node.attrib["Version"] for node in tree.findall(".//PackageReference")}
+    assert "MathNet.Numerics.FSharp" in packages
+
+
+def test_gptscan_dependencies_keep_compatible_version_constraints() -> None:
+    lines = (ROOT / "docker/vendor/gptscan/requirements-docker.txt").read_text().splitlines()
+    requirements = {}
+    for line in lines:
+        line = re.split(r"\s+#", line, maxsplit=1)[0].strip()
+        if line and not line.startswith("#"):
+            item = Requirement(line)
+            requirements[item.name.lower().replace("_", "-")] = item
+    for name, version in (("z3-solver", "4.11.2.0"), ("crytic-compile", "0.3.3"), ("pysha3", "1.0.2")):
+        assert requirements[name].specifier == SpecifierSet("==" + version)
+    assert "falcon-analyzer" not in requirements
+
+
+def test_private_and_generated_files_are_ignored_by_git() -> None:
+    ignored = ["toolcards/.private/probe.json", "docker/vendor/smartian/build/probe.dll", "build/stale.whl"]
+    public = ["toolcards/performance_db.json", "toolcards/passage_store.json", ".env.example"]
+    result = subprocess.run(["git", "check-ignore", "--no-index", "--stdin"], cwd=ROOT,
+                            input="\n".join(ignored + public) + "\n", capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert set(result.stdout.splitlines()) == set(ignored)
+    tracked = subprocess.run(["git", "ls-files", "--", "toolcards/.private"], cwd=ROOT,
+                             capture_output=True, text=True, check=True)
+    assert not tracked.stdout.splitlines()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LAKES_TEST_RUNTIME_IMAGE"),
+    reason="set LAKES_TEST_RUNTIME_IMAGE to a built image",
+)
+def test_release_image_runs_smartian_solc_and_falcon() -> None:
+    script = r"""
+from pathlib import Path
+import subprocess
+import sys
+
+base = Path('/work/docker/vendor/smartian')
+dll = base / 'build/Smartian.dll'
+for artifact in (dll, base / 'src/Agent/AttackerContract.bin', base / 'src/Agent/SFuzzContract.bin'):
+    assert artifact.stat().st_size > 0, artifact
+runtime = subprocess.run(['dotnet', '--info'], capture_output=True, text=True, timeout=10)
+assert runtime.returncode == 0, runtime.stdout + runtime.stderr
+smartian = subprocess.run(['dotnet', str(dll)], capture_output=True, text=True, timeout=20)
+assert 'Usage:' in smartian.stdout + smartian.stderr, smartian.stdout + smartian.stderr
+solc = subprocess.run(['solc', '--version'], capture_output=True, text=True, timeout=10)
+assert solc.returncode == 0, solc.stdout + solc.stderr
+check = subprocess.run([
+    '/work/docker/vendor/gptscan/.venv/bin/python', '-c',
+    "import platform; from importlib.metadata import version; import z3; from falcon import Falcon; "
+    "expected = '4.13.0.0' if platform.machine() == 'aarch64' else '4.11.2.0'; "
+    "assert version('z3-solver') == expected"
+], capture_output=True, text=True, timeout=15)
+assert check.returncode == 0, check.stdout + check.stderr
+"""
+    result = subprocess.run([
+        "docker", "run", "--rm", "--pull=never", "--network=none", "--entrypoint", "python",
+        os.environ["LAKES_TEST_RUNTIME_IMAGE"], "-c", script,
+    ], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LAKES_TEST_RUNTIME_IMAGE"),
+    reason="set LAKES_TEST_RUNTIME_IMAGE to enable Docker build-context checks",
+)
+def test_docker_build_context_excludes_private_and_generated_files(tmp_path) -> None:
+    context = tmp_path / "context"
+    context.mkdir()
+    shutil.copy2(ROOT / ".dockerignore", context / ".dockerignore")
+    public = ("public.json", "toolcards/performance_db.json", "toolcards/passage_store.json", ".env.example")
+    ignored = (
+        "toolcards/.private/credentials.json", "docker/vendor/smartian/build/stale.dll",
+        "build/stale.whl", "runtime-jobs/job-a/input/Private.sol", ".env",
+    )
+    for relative in public + ignored:
+        path = context / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative)
+    exported = tmp_path / "exported"
+    result = subprocess.run([
+        "docker", "build", "--network=none", "--progress=plain",
+        "--output", f"type=local,dest={exported}", "-f", "-", str(context),
+    ], input="FROM scratch\nCOPY . /context/\n",
+        env={**os.environ, "BUILDX_CONFIG": str(tmp_path / "buildx")},
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for relative in public:
+        assert (exported / "context" / relative).read_text() == relative
+    for relative in ignored:
+        assert not (exported / "context" / relative).exists(), relative

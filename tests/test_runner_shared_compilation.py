@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -416,3 +417,37 @@ def test_smartian_bundle_route_preserves_engine_command_shape(
     assert command[command.index("-a") + 1] == str(abi)
     report = json.loads((tmp_path / "out" / "result.json").read_text(encoding="utf-8"))
     assert report["parser"]["bundle_id"] == "bundle-1"
+
+
+
+def test_smartian_preflight_accepts_a_dotnet_runtime_without_sdk(tmp_path, monkeypatch) -> None:
+    module = _load_smartian_module()
+    source = tmp_path / "Main.sol"
+    source.write_text("contract Main {}")
+    dll = tmp_path / "Smartian.dll"
+    dll.write_bytes(b"fixture")
+    abi = tmp_path / "Main.abi.json"
+    abi.write_text("[]")
+    bytecode = tmp_path / "Main.bin"
+    bytecode.write_text("6000")
+    probes = tmp_path / "runtime-probes.jsonl"
+    runtime = tmp_path / "dotnet"
+    runtime.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\nfrom pathlib import Path\n"
+        f"with Path({str(probes)!r}).open('a') as output:\n"
+        "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "supported = [['--info'], ['--list-runtimes'], ['--help']]\n"
+        "raise SystemExit(0 if sys.argv[1:] in supported else 145)\n"
+    )
+    runtime.chmod(0o755)
+    executions = []
+    monkeypatch.setattr(module, "_run_one_contract", lambda **kwargs: executions.append(kwargs) or 0)
+    monkeypatch.setattr(sys, "argv", [
+        "run_smartian.py", str(source), str(tmp_path / "out"),
+        "--smartian_dll", str(dll), "--dotnet", str(runtime),
+        "--shared-abi", str(abi), "--shared-bytecode", str(bytecode),
+    ])
+    assert module.main() == 0
+    assert probes.read_text().splitlines()
+    assert len(executions) == 1

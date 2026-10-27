@@ -27,46 +27,33 @@ def _prepare_securify_run(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     return contract, tmp_path / "out"
 
 
-def test_securify_existing_exact_image_skips_build(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-) -> None:
+def test_securify_existing_exact_image_skips_build(tmp_path: Path, monkeypatch) -> None:
     contract, out_dir = _prepare_securify_run(tmp_path, monkeypatch)
-    inspect_calls: list[tuple[list[str], dict[str, object]]] = []
-    stream_calls: list[list[str]] = []
+    inspected_images = []
+    stream_calls = []
 
     def fake_run(command, **kwargs):
-        inspect_calls.append((command, kwargs))
+        inspected_images.append(command[command.index("inspect") + 1])
         return SimpleNamespace(returncode=0)
 
     def fake_stream(command, **kwargs):
         stream_calls.append(command)
         return 0
 
+    def unexpected_build(*args, **kwargs):
+        raise AssertionError("an existing analyzer image must be reused")
+
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
     monkeypatch.setattr(runner, "_stream_process", fake_stream)
+    monkeypatch.setattr(runner, "_run_securify2_build_process", unexpected_build)
 
-    rc = runner._run_securify2(contract, out_dir, target_root=contract)
-
-    assert rc == 0
-    assert inspect_calls == [
-        (
-            ["docker", "image", "inspect", "securify:0.5.4"],
-            {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.PIPE,
-                "check": False,
-                "text": True,
-                "timeout": runner._SECURIFY2_IMAGE_INSPECT_TIMEOUT_SECONDS,
-            },
-        )
-    ]
-    assert len(stream_calls) == 1
-    assert stream_calls[0][0:2] == ["python3", str(runner.SECURIFY2_RUNNER)]
-    assert "--sudo" not in stream_calls[0]
+    assert runner._run_securify2(contract, out_dir, target_root=contract) == 0
+    assert runner._run_securify2(contract, out_dir, target_root=contract) == 0
+    assert inspected_images == ["securify:0.5.4"]
+    assert len(stream_calls) == 2
+    for command in stream_calls:
+        assert command[command.index("--image") + 1] == "securify:0.5.4"
     assert "securify:0.5.4" in runner._SECURIFY2_IMAGE_CACHE
-    assert "image inspect confirmed existing tag; skipping build" in capsys.readouterr().out
 
 
 def test_securify_transient_inspect_failure_then_success_skips_build(

@@ -64,12 +64,13 @@ def _single_dataset(tmp_path: Path) -> tuple[Path, Path]:
     return corpus, manifest
 
 
-def test_builder_is_tracked_installable_module() -> None:
-    assert Path(builder.__file__).parent.name == "toolrank"
-    pyproject = Path(__file__).parents[1] / "pyproject.toml"
-    assert 'lakes-profile-builder = "toolrank.profile_builder:main"' in pyproject.read_text(
-        encoding="utf-8"
-    )
+def test_builder_module_exposes_working_command(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        builder.main(["--help"])
+    assert stopped.value.code == 0
+    help_text = capsys.readouterr().out
+    for option in ("--corpus-root", "--manifest", "--output"):
+        assert option in help_text
 
 
 def test_configurable_root_build_is_deterministic_and_complete(

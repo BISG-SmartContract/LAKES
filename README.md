@@ -208,9 +208,9 @@ docker run --rm \
 ```bash
 mkdir -p LAKES_out
 docker run --rm --privileged \
-  --mount type=volume,src=lakes-docker-cache,dst=/var/lib/docker \
-  --mount type=bind,src="$PWD/input",dst=/work/input,readonly \
-  --mount type=bind,src="$PWD/LAKES_out",dst=/work/LAKES_out \
+  -v lakes-docker-cache:/var/lib/docker \
+  -v "$PWD/input:/work/input:ro" \
+  -v "$PWD/LAKES_out:/work/LAKES_out" \
   -e DEEPSEEK_API_KEY -e OPENAI_API_KEY \
   -e LAKES_OPENAI_BASE_URL -e LAKES_OPENAI_MODEL \
   lakes:latest recommend /work/input/contracts/Main.sol \
@@ -232,6 +232,13 @@ uv run lakes recommend /path/to/Contract.sol --emit summary
 
 本例生成推荐方案。本地添加 `--execute` 执行检测时，需准备对应分析器环境；Docker 镜像已集成该环境。
 
+也可在已激活的虚拟环境中通过 pip 安装源码：
+
+```bash
+python -m pip install -e .
+lakes --help
+```
+
 ## 测试
 
 运行常规测试：
@@ -240,12 +247,12 @@ uv run lakes recommend /path/to/Contract.sol --emit summary
 uv run pytest -q
 ```
 
-6 个集成测试用例通过环境变量指定镜像后启用：
+8 个集成测试用例通过环境变量指定镜像后启用：
 
 | 环境变量 | 用例数 | 内容 |
 | --- | --- | --- |
 | `LAKES_TEST_SHARED_RUNTIME_IMAGE` | 2 | 共享 runtime 并发、资源限制、任务清理和缓存保留。 |
-| `LAKES_TEST_RUNTIME_IMAGE` | 4 | 真实 solc/Falcon 编译：单文件、目录、多入口和旧调用方式。 |
+| `LAKES_TEST_RUNTIME_IMAGE` | 6 | 真实 solc/Falcon 编译、镜像运行环境和 Docker 构建上下文隔离。 |
 
 启用全部测试：
 

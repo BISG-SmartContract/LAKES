@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,11 +125,101 @@ def test_custom_gptscan_host_receives_no_deepseek_only_request_fields(
     assert "response_format" not in calls[0]
 
 
-def test_gptscan_structured_callers_enable_json_mode() -> None:
-    source = (GPTSCAN_SOURCE / "analyze_pipeline.py").read_text(encoding="utf-8")
+def _load_pipeline(monkeypatch):
+    chat, calls = _load_chat_module(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_BASE", "https://api.deepseek.com")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("GPTSCAN_USE_GPT4", "true")
 
-    assert "args=(prompt, gpt4, json_mode)" in source
-    assert source.count("ask_with_timeout(prompt, json_mode=True)") == 2
-    assert source.count(
-        'ask_with_timeout(prompts+"\\n"+source, json_mode=True)'
-    ) == 2
+    def respond(**kwargs):
+        calls.append({**kwargs, "messages": [dict(message) for message in kwargs["messages"]]})
+        prompt = kwargs["messages"][-1]["content"]
+        if "response_format" in kwargs:
+            payload = {"1": "Yes"} if prompt.startswith("JSON:") else {"answer": ["value"]}
+            content = json.dumps(payload)
+        else:
+            content = "Yes"
+        return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(sys.modules["openai"].ChatCompletion, "create", staticmethod(respond))
+    chat_module = ModuleType("chatgpt_api")
+    chat_module.Chat = chat.Chat
+    templates = ModuleType("query_template")
+    templates.prompt_single_yes_no_question = lambda _question, source: "TEXT:" + source
+    templates.prompt_multiple_choice_scenarios = lambda _questions, source: "JSON:" + source
+    utils = ModuleType("utils")
+    utils.split_answer_section = lambda response: response
+    antlr = ModuleType("antlr4helper")
+    antlr.__path__ = []
+    antlr.parseString = lambda _source: None
+    callgraph = ModuleType("antlr4helper.callgraph")
+    callgraph.CallGraph = type("CallGraph", (), {})
+    for name, module in (
+        ("chatgpt_api", chat_module), ("query_template", templates), ("utils", utils),
+        ("antlr4helper", antlr), ("antlr4helper.callgraph", callgraph),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys.modules["rich_utils"], "make_prompt_panel", lambda *_a: None, raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "_lakes_test_gptscan_pipeline", GPTSCAN_SOURCE / "analyze_pipeline.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class ImmediatePool:
+        def __init__(self, **kwargs):
+            pass
+
+        def apply_async(self, function, args=(), kwds=None):
+            return SimpleNamespace(ready=lambda: True, get=lambda: function(*args, **(kwds or {})))
+
+        def close(self):
+            pass
+
+        def terminate(self):
+            pass
+
+        def join(self):
+            pass
+
+    monkeypatch.setattr(module.multiprocessing, "Pool", ImmediatePool)
+    return module, calls
+
+
+@pytest.mark.parametrize("single", [False, True], ids=["multiple-values", "single-value"])
+def test_gptscan_static_json_callers_request_and_parse_json(monkeypatch, single) -> None:
+    module, calls = _load_pipeline(monkeypatch)
+    if single:
+        assert module.ask_for_static_json_single("find values", "source", "answer") == {"answer": ["value"]}
+    else:
+        answer, raw = module.ask_for_static_json("find values", "source", ["answer"])
+        assert answer == {"answer": "value"}
+        assert raw == {"answer": ["value"]}
+    assert calls
+    assert all(call.get("response_format") == {"type": "json_object"} for call in calls)
+
+
+def test_gptscan_scenario_and_caller_paths_request_json(tmp_path, monkeypatch) -> None:
+    module, calls = _load_pipeline(monkeypatch)
+    source = tmp_path / "Probe.sol"
+    source.write_text(
+        "contract Probe {\nfunction target() public {\nreturn;\n}\n"
+        "function caller() public {\ntarget();\n}\n}\n"
+    )
+    target = {"name": "target", "visibility": "public", "loc": {"start": "2:0", "end": "4:0"}}
+    caller = {"name": "caller", "visibility": "public", "loc": {"start": "5:0", "end": "7:0"}}
+    caller_key = (str(source), "Probe", "caller")
+    graph = SimpleNamespace(
+        files={str(source): {"subcontracts": [{"name": "Probe", "functions": [target]}]}},
+        get_callers=lambda _name: [caller_key],
+        get_function_detail=lambda *_args: caller,
+    )
+    monkeypatch.setattr(module, "CallGraph", lambda _folder: graph)
+    rule = {"name": "probe-rule", "functions": ["target"], "property": ["scenario", "question"]}
+    result, _graph, _metadata = module.ask_whether_has_vul_with_scenario_v9(str(tmp_path), [rule])
+    findings = result[str(source)]["Probe"]["target"]
+    assert findings["__ONLY_FUNCTION__"]["data"] == [rule]
+    assert findings["!!!".join(caller_key)]["data"] == [rule]
+    structured = [call for call in calls if call["messages"][-1]["content"].startswith("JSON:")]
+    assert len(structured) == 2
+    assert all(call.get("response_format") == {"type": "json_object"} for call in structured)
