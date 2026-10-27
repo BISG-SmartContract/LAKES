@@ -652,6 +652,7 @@ def _native_smartbugs_execute(
                                 "LAKES_PROJECT_ROOT",
                                 "LAKES_SOLIDITY_CONSTRAINTS",
                                 "LAKES_EXECUTION_SOLC_VERSION",
+                                "LAKES_DOCKER_TOOL",
                             ):
                                 if name in invocation.env:
                                     child_env[name] = invocation.env[name]
@@ -842,6 +843,9 @@ def execute_plan(
     *,
     runner_env: Mapping[str, str] | None = None,
 ) -> ExecutionResult:
+    from toolrank import docker_runtime
+
+    docker_runtime.configure(plan.target_path, plan.results_root)
     plan = _resolve_execution_project(plan)
     if not plan.runner_command:
         return plan.model_copy(update={"status": "failed", "stderr_tail": "missing runner command"})

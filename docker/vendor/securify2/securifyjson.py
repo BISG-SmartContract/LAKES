@@ -10,6 +10,8 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from toolrank import docker_runtime
+
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
@@ -156,6 +158,7 @@ def run_securify_docker(
 
     contract_path = os.path.abspath(contract_path)
     contract_dir = os.path.abspath(project_root) if project_root else os.path.dirname(contract_path)
+    docker_runtime.configure(contract_path, contract_dir)
     try:
         contract_file = os.path.relpath(contract_path, contract_dir)
     except ValueError:
@@ -168,12 +171,12 @@ def run_securify_docker(
         cmd.append("sudo")
 
     # Build the exact docker command
-    cmd += [docker_bin, "run", "--rm", "-i"]
+    cmd += [docker_bin, "run", "--rm", "-i", *docker_runtime.cli_args("securify2")]
     if tty:
         cmd.append("-t")
     if platform:
         cmd += ["--platform", platform]
-    cmd += ["-v", f"{contract_dir}:/share", image, "--interpreter", f"/share/{contract_file}"]
+    cmd += ["-v", f"{docker_runtime.shared_path(contract_dir)}:/share", image, "--interpreter", f"/share/{contract_file}"]
     cmd_str = " ".join(cmd)
 
     if tty:

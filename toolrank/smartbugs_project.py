@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from toolrank import docker_runtime
 from toolrank.source_project import copy_dependency_tree
 from toolrank.solc_range import version_satisfies_solidity_constraint
 from toolrank.smartbugs_solc import install_compiler_guards
@@ -44,6 +45,19 @@ def select_project_solc_version(
 def _install_project_patches() -> None:
     import sb.docker
     import sb.semantic_version
+
+    runtime = docker_runtime.configure()
+    if (runtime is not None and hasattr(sb.docker, "load")
+            and not getattr(sb.docker.load, "_lakes_shared_load", False)):
+        original_load = sb.docker.load
+
+        def shared_load(image):
+            with docker_runtime.image_lock(image):
+                if not sb.docker.is_loaded(image):
+                    original_load(image)
+
+        shared_load._lakes_shared_load = True
+        sb.docker.load = shared_load
 
     try:
         import sb.solc
@@ -98,6 +112,9 @@ def _install_project_patches() -> None:
 
     def project_args(task, workspace):
         args = original_args(task, workspace)
+        args = docker_runtime.container_args(
+            args, os.environ.get("LAKES_DOCKER_TOOL") or getattr(task.tool, "id", "smartbugs"),
+        )
         if task.tool.mode != "solidity":
             return args
         try:

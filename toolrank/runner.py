@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping, Optional, Sequence
 
 from toolrank.categories import normalize_category
+from toolrank import docker_runtime
 from toolrank.adapter_capabilities import adapter_supports_input
 from toolrank.compilation import (
     CompilationBundleError,
@@ -819,7 +820,26 @@ def _run_securify2(
         )
     version = version or SECURIFY2_DEFAULT_SOLC
     image = SECURIFY2_IMAGE_TEMPLATE.format(version=version)
-    if image not in _SECURIFY2_IMAGE_CACHE:
+    with docker_runtime.image_lock(image):
+        prepared = _prepare_securify2_image(image, version)
+    if prepared != 0:
+        return prepared
+    # Release the image lock before analysis: jobs sharing a warm image must run
+    # concurrently, even if their first build was serialized.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return _stream_process(
+        [
+            "python3", str(SECURIFY2_RUNNER), str(contract_path),
+            "-o", str(out_dir / "result.json"), "--image", image,
+            "--platform", SECURIFY2_PLATFORM, "--debug-cmd", "--project-root",
+            str(target_root if target_root.is_dir() else contract_path.parent),
+        ],
+        cwd=SECURIFY2_RUNNER.parent,
+    )
+
+
+def _prepare_securify2_image(image: str, version: str) -> int:
+    if docker_runtime.config() is not None or image not in _SECURIFY2_IMAGE_CACHE:
         image_state = _inspect_docker_image(image)
         if image_state == "error":
             return 1
@@ -841,24 +861,7 @@ def _run_securify2(
             if rc != 0:
                 return rc
         _SECURIFY2_IMAGE_CACHE.add(image)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return _stream_process(
-        [
-            "python3",
-            str(SECURIFY2_RUNNER),
-            str(contract_path),
-            "-o",
-            str(out_dir / "result.json"),
-            "--image",
-            image,
-            "--platform",
-            SECURIFY2_PLATFORM,
-            "--debug-cmd",
-            "--project-root",
-            str(target_root if target_root.is_dir() else contract_path.parent),
-        ],
-        cwd=SECURIFY2_RUNNER.parent,
-    )
+    return 0
 
 
 def _run_sailfish(
@@ -1039,6 +1042,7 @@ def prepare_smartbugs_invocation(
 ) -> Iterator[SmartBugsInvocation]:
     """Prepare one typed generic SmartBugs invocation and clean temp input."""
 
+    runtime = docker_runtime.configure(contract_path, out_dir, project_root)
     try:
         resolved_project_root = (
             resolve_project_root(contract_path, project_root)
@@ -1102,17 +1106,18 @@ def prepare_smartbugs_invocation(
             or bool(exact_execution_solc)
             or not (target_root.is_file() and not solidity_imports(contract_path))
         )
-        if requires_project_bridge and not smartbugs_api_available:
+        if (requires_project_bridge or runtime is not None) and not smartbugs_api_available:
             raise SmartBugsPreparationError(
-                "SmartBugs Python API unavailable; cannot preserve source imports"
+                "SmartBugs Python API unavailable; cannot preserve source imports or shared-runtime metadata"
             )
-        if effective_kind == "sol" and smartbugs_api_available:
+        if smartbugs_api_available and (effective_kind == "sol" or runtime is not None):
             smartbugs_python = resolved_smartbugs_dir / ".venv" / "bin" / "python"
             command_prefix = [
                 str(smartbugs_python if smartbugs_python.exists() else Path(sys.executable)),
                 str(SMARTBUGS_PROJECT_RUNNER),
             ]
             env = os.environ.copy()
+            env["LAKES_DOCKER_TOOL"] = tool_id
             pythonpath = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = os.pathsep.join(
                 part
@@ -1815,6 +1820,7 @@ def run_targets(
     selected_tool_solc_ranges: dict[str, str] | None = None,
     project_root: str | Path | None = None,
 ) -> int:
+    docker_runtime.configure(target_path, results_root, project_root)
     try:
         project_root = (
             resolve_project_root(target_path, project_root)

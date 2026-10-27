@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from typing import Mapping, Sequence
+
+from toolrank import docker_runtime
 
 
 _PROCESS_REAP_TIMEOUT_SECONDS = 0.2
@@ -66,6 +69,44 @@ def _communicate_after_termination(
 
 
 def run_process_with_deadline(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
+    capture_output: bool = True,
+    display_command: Sequence[str] | None = None,
+    ready_file: str | Path | None = None,
+    startup_timeout_seconds: float = 10.0,
+) -> DeadlineProcessResult:
+    runtime_env = docker_runtime.process_env(env)
+    try:
+        result = _run_process_with_deadline(
+            command, timeout_seconds=timeout_seconds, cwd=cwd, env=runtime_env,
+            input_text=input_text, capture_output=capture_output,
+            display_command=display_command, ready_file=ready_file,
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
+    except BaseException:
+        try:
+            docker_runtime.cleanup(runtime_env)
+        except RuntimeError:
+            print("[warn] shared-runtime cleanup unavailable; scheduler must retry", file=sys.stderr)
+        raise
+    # Killing a client process does not stop containers on a shared daemon.
+    # Preserve an original failure/timeout if cleanup also fails. A successful
+    # report cannot be published as successful while cleanup remains uncertain.
+    try:
+        docker_runtime.cleanup(runtime_env)
+    except RuntimeError as exc:
+        print(f"[warn] {exc}; scheduler must retry cleanup", file=sys.stderr)
+        return replace(result, returncode=result.returncode or 1,
+                       stderr=(result.stderr + "\n" + str(exc)).strip())
+    return result
+
+
+def _run_process_with_deadline(
     command: Sequence[str],
     *,
     timeout_seconds: float,

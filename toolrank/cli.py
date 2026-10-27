@@ -7,6 +7,7 @@ from typing import Optional
 import typer
 
 from toolrank.cego import CegoError
+from toolrank import docker_runtime
 from toolrank.engine import run_recommendation
 from toolrank.kb_update import app as kb_app
 
@@ -94,6 +95,7 @@ def recommend(
         )
 
     try:
+        docker_runtime.configure(target_path, project_root, results_root)
         result = run_recommendation(
             target_path=target_path,
             project_root=project_root,

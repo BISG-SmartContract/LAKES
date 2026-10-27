@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import subprocess
+from toolrank import docker_runtime
 import sys
 import textwrap
 from pathlib import Path
@@ -357,6 +358,7 @@ def run_sailfish(
         if artifacts_root is not None
         else source_dir
     )
+    docker_runtime.configure(source_dir, artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     source_path = source_dir / sol_filename
     sailfish_out = artifacts_dir / "sailfish_out"
@@ -472,17 +474,19 @@ PY
         "docker",
         "run",
         "--rm",
+        *docker_runtime.cli_args("sailfish"),
         "--platform",
         PLATFORM,
         *extra_env,
     ]
     if local_solc_bin:
-        docker_cmd += ["-v", f"{str(local_solc_bin)}:/tmp/host_solc:ro"]
+        local_solc_bin = docker_runtime.stage_bind_file(local_solc_bin)
+        docker_cmd += ["-v", f"{local_solc_bin}:/tmp/host_solc:ro"]
     docker_cmd += [
         "-v",
-        f"{str(source_dir)}:{inner_src}:ro",
+        f"{docker_runtime.shared_path(source_dir)}:{inner_src}:ro",
         "-v",
-        f"{str(artifacts_dir)}:{inner_out}",
+        f"{docker_runtime.shared_path(artifacts_dir)}:{inner_out}",
         "-w",
         inner_out,
         IMAGE,

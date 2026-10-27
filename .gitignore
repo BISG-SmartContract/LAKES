@@ -35,6 +35,7 @@ allinone.md
 # ToolRank generated output and local research artifacts
 out/
 LAKES_out/
+runtime-jobs/
 Paper.pdf/
 MinerU/
 experiments_*/
